@@ -1,0 +1,2364 @@
+--[[
+    ================================================================================
+    🪐 ORBIT — P2P LOCALSCRIPT ADMIN & VECTOR SUITE (FULL PRODUCTION v5.0)
+    ================================================================================
+    Uyumluluk    : %100 Standart Lua 5.1 / Luau (Tüm Executorlar & Roblox Studio LocalScript)
+    Mimari       : 100% Client-Side LocalScript + P2P Humanoid.Animator Replikasyonu
+    Kanal        : AnimationTrack (TimePosition + Speed + Weight Strobe) + Chat Hook
+    Vektör Motoru: Saf Vektörel Çizim (2D Frame/Line Geometri + Drawing API ESP)
+    Özellikler   :
+      [1] Çalıştığı anda F9 Konsola (print/warn) detaylı önyükleme çıktısı verir.
+      [2] Tam 3 saniye sonra sağdan smooth kayarak gelen Vektörel Taçlı "Admin" butonu.
+      [3] Admin butonu geldiği anda ekran hafif kararır (Dim + Blur) ve Script Tanıtımı / Rehber açılır.
+      [4] Görseldeki tasarımla birebir 9 Sekmeli, Sürüklenebilir (Draggable) ve Boyutlandırılabilir (Resizable) GUI.
+      [5] Her butona tıklayınca küçülüp bırakınca büyüme (Spring Bounce), ses efekti ve dokunulan yerde iz (Ripple).
+      [6] Gerçek P2P Peer Sistemi: Diğer ORBIT kullanan oyuncuları otomatik algılar ve tüm efektleri/komutları senkronlar.
+    ================================================================================
+]]
+
+print("==================================================================")
+print("[ORBIT P2P] Başlatılıyor... LocalScript & P2P Animate Motoru v5.0")
+print("==================================================================")
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local SoundService = game:GetService("SoundService")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- Güvenli GUI Ebeveyn Seçici (gethui -> CoreGui -> PlayerGui sırasıyla dener, asla çökmez)
+local function GetSafeGuiParent()
+    local okHui, hui = pcall(function()
+        if type(gethui) == "function" then
+            return gethui()
+        end
+        return nil
+    end)
+    if okHui and hui then
+        return hui
+    end
+
+    local okCore, core = pcall(function()
+        local cg = game:GetService("CoreGui")
+        local testFolder = Instance.new("Folder")
+        testFolder.Parent = cg
+        testFolder:Destroy()
+        return cg
+    end)
+    if okCore and core then
+        return core
+    end
+
+    local pgui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+    return pgui
+end
+
+-- Eski ORBIT örneği varsa temizle
+local GuiParent = GetSafeGuiParent()
+if GuiParent then
+    local old = GuiParent:FindFirstChild("OrbitP2PAdminGui")
+    if old then
+        old:Destroy()
+    end
+end
+if Lighting:FindFirstChild("OrbitIntroBlur") then
+    Lighting.OrbitIntroBlur:Destroy()
+end
+
+-- // YAPILANDIRMA & DURUM TABLOSU
+local OrbitConfig = {
+    Prefix = ":",
+    StartupDelay = 3,
+    CarrierAnimationId = "rbxassetid://507766388",
+    HandshakeAnimationId = "rbxassetid://507770239",
+    FlySpeed = 75,
+    WalkSpeed = 16,
+    JumpPower = 50,
+    SoundEnabled = true,
+    RippleEnabled = true,
+    IsMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled,
+    WinWidth = 880,
+    WinHeight = 540,
+    MinWidth = 620,
+    MinHeight = 420,
+    MaxWidth = 1160,
+    MaxHeight = 760
+}
+
+local OrbitState = {
+    GuiVisible = false,
+    CompactSidebar = false,
+    Maximized = false,
+    ActiveTab = "Ana Panel",
+    Flying = false,
+    Noclip = false,
+    InfiniteJump = false,
+    ESP = false,
+    Tracers = true,
+    ActiveAura = "None",
+    OrbitTarget = nil,
+    OrbitAngle = 0,
+    SelectedPlayer = LocalPlayer,
+    VerifiedPeers = {}, -- [userId] = true (ORBIT kullanan diğer P2P oyuncular)
+    FrozenPeers = {},
+    BannedUserIds = {},
+    Waypoints = {
+        { Name = "Spawn Noktası", Pos = Vector3.new(0, 5, 0) },
+        { Name = "Yüksek Gözlem Noktası", Pos = Vector3.new(0, 120, 0) },
+        { Name = "P2P Düello Alanı", Pos = Vector3.new(85, 5, -85) }
+    },
+    Logs = {}
+}
+
+OrbitState.VerifiedPeers[LocalPlayer.UserId] = true
+
+-- // SES MOTORU (Tıklama, Sekme Değişimi, P2P Sinyal ve Açılış Sesleri)
+local SoundIds = {
+    Click = "rbxassetid://6895079853",
+    Tab = "rbxassetid://6042053626",
+    Broadcast = "rbxassetid://9114374439",
+    Intro = "rbxassetid://6026984224",
+    Alert = "rbxassetid://4590662766"
+}
+
+local function PlaySound(kind, pitch)
+    if not OrbitConfig.SoundEnabled then return end
+    task.spawn(function()
+        pcall(function()
+            local s = Instance.new("Sound")
+            s.SoundId = SoundIds[kind] or SoundIds.Click
+            s.Volume = 0.45
+            s.PlaybackSpeed = pitch or 1
+            s.Parent = SoundService
+            s:Play()
+            task.delay(2, function()
+                if s and s.Parent then s:Destroy() end
+            end)
+        end)
+    end)
+end
+
+-- // LOGLAMA MOTORU (Hem F9 Konsola Hem GUI Log Sekmesine Yazar)
+local RefreshLogUI = nil
+local RefreshPeersUI = nil
+
+local function AddLog(category, senderName, message)
+    local timeStr = os.date("%H:%M:%S")
+    local entry = {
+        Time = timeStr,
+        Category = category,
+        Sender = senderName,
+        Message = message
+    }
+    table.insert(OrbitState.Logs, 1, entry)
+    if #OrbitState.Logs > 120 then
+        table.remove(OrbitState.Logs)
+    end
+    print(string.format("[ORBIT %s] (%s) %s: %s", category, timeStr, senderName, message))
+    if RefreshLogUI then
+        pcall(RefreshLogUI)
+    end
+end
+
+AddLog("BOOT", LocalPlayer.Name, "ORBIT LocalScript belleğe yüklendi. 3 saniye sonra sağ Admin butonu kayarak gelecek...")
+
+-- // ANA SCREENGUI OLUŞTURMA
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "OrbitP2PAdminGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = GuiParent
+
+-- // VEKTÖREL ÇİZİM MOTORU (Hiçbir dış resim/decal kullanmadan saf Vektör Geometri ile simge çizer)
+local VectorCanvas = {}
+
+function VectorCanvas.DrawSegment(parent, x1, y1, x2, y2, thickness, color, zIndex)
+    local dx = x2 - x1
+    local dy = y2 - y1
+    local dist = math.sqrt(dx * dx + dy * dy)
+    local cx = (x1 + x2) / 2
+    local cy = (y1 + y2) / 2
+    local angle = math.deg(math.atan2(dy, dx))
+
+    local line = Instance.new("Frame")
+    line.Name = "VectorSegment"
+    line.BorderSizePixel = 0
+    line.BackgroundColor3 = color or Color3.fromRGB(240, 244, 250)
+    line.AnchorPoint = Vector2.new(0.5, 0.5)
+    line.Position = UDim2.new(cx, 0, cy, 0)
+    line.Size = UDim2.new(dist, 0, 0, thickness or 2)
+    line.Rotation = angle
+    line.ZIndex = zIndex or 5
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = line
+    line.Parent = parent
+    return line
+end
+
+function VectorCanvas.DrawCircleRing(parent, cx, cy, scaleRadius, strokeWidth, color, filled, zIndex)
+    local ring = Instance.new("Frame")
+    ring.Name = "VectorRing"
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.Position = UDim2.new(cx, 0, cy, 0)
+    ring.Size = UDim2.new(scaleRadius * 2, 0, scaleRadius * 2, 0)
+    ring.BackgroundColor3 = color or Color3.fromRGB(240, 244, 250)
+    ring.BackgroundTransparency = filled and 0 or 1
+    ring.BorderSizePixel = 0
+    ring.ZIndex = zIndex or 5
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(1, 0)
+    c.Parent = ring
+    if not filled then
+        local st = Instance.new("UIStroke")
+        st.Color = color or Color3.fromRGB(240, 244, 250)
+        st.Thickness = strokeWidth or 1.8
+        st.Parent = ring
+    end
+    ring.Parent = parent
+    return ring
+end
+
+-- İstenilen ikonu 24x24 normalize vektör koordinatlarıyla çizer
+function VectorCanvas.CreateIcon(parent, iconName, sizePx, color, zIndex)
+    local holder = Instance.new("Frame")
+    holder.Name = "VectorIcon_" .. tostring(iconName)
+    holder.BackgroundTransparency = 1
+    holder.Size = UDim2.new(0, sizePx or 18, 0, sizePx or 18)
+    holder.ZIndex = zIndex or 5
+    holder.Parent = parent
+
+    local col = color or Color3.fromRGB(235, 240, 248)
+    local z = (zIndex or 5) + 1
+    local seg = function(x1, y1, x2, y2, th)
+        VectorCanvas.DrawSegment(holder, x1, y1, x2, y2, th or 1.8, col, z)
+    end
+    local ring = function(cx, cy, r, th, fill)
+        VectorCanvas.DrawCircleRing(holder, cx, cy, r, th or 1.8, col, fill, z)
+    end
+
+    if iconName == "crown" then
+        -- Vektörel Taç Simgesi
+        seg(0.15, 0.78, 0.85, 0.78, 2.2)
+        seg(0.15, 0.78, 0.12, 0.35, 2)
+        seg(0.12, 0.35, 0.35, 0.55, 2)
+        seg(0.35, 0.55, 0.50, 0.22, 2)
+        seg(0.50, 0.22, 0.65, 0.55, 2)
+        seg(0.65, 0.55, 0.88, 0.35, 2)
+        seg(0.88, 0.35, 0.85, 0.78, 2)
+    elseif iconName == "orbit" then
+        -- Gezegen ve Yörünge Halkası
+        ring(0.5, 0.5, 0.24, 1.8, false)
+        seg(0.10, 0.68, 0.90, 0.32, 1.8)
+    elseif iconName == "home" then
+        -- Ana Panel Ev Simgesi
+        seg(0.15, 0.50, 0.50, 0.18, 2)
+        seg(0.50, 0.18, 0.85, 0.50, 2)
+        seg(0.24, 0.46, 0.24, 0.84, 2)
+        seg(0.76, 0.46, 0.76, 0.84, 2)
+        seg(0.24, 0.84, 0.76, 0.84, 2)
+    elseif iconName == "users" then
+        -- Oyuncu Yönetimi Çift Kişi Simgesi
+        ring(0.38, 0.34, 0.14, 1.8, false)
+        ring(0.68, 0.36, 0.11, 1.6, false)
+        seg(0.16, 0.80, 0.26, 0.60, 1.8)
+        seg(0.26, 0.60, 0.50, 0.60, 1.8)
+        seg(0.50, 0.60, 0.60, 0.80, 1.8)
+        seg(0.56, 0.62, 0.76, 0.62, 1.6)
+        seg(0.76, 0.62, 0.86, 0.80, 1.6)
+    elseif iconName == "run" then
+        -- Hareket Kontrolleri Koşan Figür
+        ring(0.62, 0.20, 0.09, 1.6, true)
+        seg(0.35, 0.40, 0.60, 0.36, 2)
+        seg(0.52, 0.38, 0.42, 0.64, 2)
+        seg(0.42, 0.64, 0.22, 0.82, 2)
+        seg(0.46, 0.56, 0.72, 0.76, 2)
+        seg(0.56, 0.38, 0.78, 0.48, 1.8)
+    elseif iconName == "pin" then
+        -- Teleport Konum İğnesi
+        ring(0.50, 0.38, 0.22, 1.8, false)
+        ring(0.50, 0.38, 0.07, 1.5, true)
+        seg(0.32, 0.48, 0.50, 0.86, 2)
+        seg(0.68, 0.48, 0.50, 0.86, 2)
+    elseif iconName == "ban" then
+        -- Kick / Ban Yasak Simgesi
+        ring(0.50, 0.50, 0.34, 2, false)
+        seg(0.26, 0.26, 0.74, 0.74, 2)
+    elseif iconName == "shield" then
+        -- Kalkan Simgesi
+        seg(0.50, 0.14, 0.82, 0.26, 2)
+        seg(0.50, 0.14, 0.18, 0.26, 2)
+        seg(0.18, 0.26, 0.24, 0.62, 2)
+        seg(0.82, 0.26, 0.76, 0.62, 2)
+        seg(0.24, 0.62, 0.50, 0.88, 2)
+        seg(0.76, 0.62, 0.50, 0.88, 2)
+    elseif iconName == "server" then
+        -- Sunucu Yönetimi Veri Katmanları
+        seg(0.20, 0.28, 0.80, 0.28, 3.2)
+        seg(0.20, 0.50, 0.80, 0.50, 3.2)
+        seg(0.20, 0.72, 0.80, 0.72, 3.2)
+    elseif iconName == "code" then
+        -- Komut Sistemi </> Simgesi
+        seg(0.34, 0.30, 0.14, 0.50, 2)
+        seg(0.14, 0.50, 0.34, 0.70, 2)
+        seg(0.66, 0.30, 0.86, 0.50, 2)
+        seg(0.86, 0.50, 0.66, 0.70, 2)
+        seg(0.56, 0.22, 0.44, 0.78, 1.8)
+    elseif iconName == "wrench" then
+        -- Ekstra Araçlar Anahtar Simgesi
+        ring(0.66, 0.34, 0.16, 1.8, false)
+        seg(0.22, 0.78, 0.54, 0.46, 2.4)
+    elseif iconName == "settings" then
+        -- Ayarlar Dişli Çark Simgesi
+        ring(0.50, 0.50, 0.22, 2, false)
+        seg(0.50, 0.12, 0.50, 0.26, 2)
+        seg(0.50, 0.74, 0.50, 0.88, 2)
+        seg(0.12, 0.50, 0.26, 0.50, 2)
+        seg(0.74, 0.50, 0.88, 0.50, 2)
+    elseif iconName == "bell" then
+        -- Bildirim Çanı
+        ring(0.50, 0.44, 0.22, 1.8, false)
+        seg(0.22, 0.68, 0.78, 0.68, 2.2)
+        ring(0.50, 0.80, 0.06, 1.5, true)
+    elseif iconName == "close" then
+        seg(0.22, 0.22, 0.78, 0.78, 2)
+        seg(0.78, 0.22, 0.22, 0.78, 2)
+    elseif iconName == "menu" then
+        seg(0.18, 0.28, 0.82, 0.28, 2)
+        seg(0.18, 0.50, 0.82, 0.50, 2)
+        seg(0.18, 0.72, 0.82, 0.72, 2)
+    elseif iconName == "maximize" then
+        seg(0.20, 0.20, 0.42, 0.20, 1.8)
+        seg(0.20, 0.20, 0.20, 0.42, 1.8)
+        seg(0.80, 0.20, 0.58, 0.20, 1.8)
+        seg(0.80, 0.20, 0.80, 0.42, 1.8)
+        seg(0.20, 0.80, 0.42, 0.80, 1.8)
+        seg(0.20, 0.80, 0.20, 0.58, 1.8)
+        seg(0.80, 0.80, 0.58, 0.80, 1.8)
+        seg(0.80, 0.80, 0.80, 0.58, 1.8)
+    elseif iconName == "arrow-right" then
+        seg(0.20, 0.50, 0.80, 0.50, 2)
+        seg(0.56, 0.26, 0.80, 0.50, 2)
+        seg(0.56, 0.74, 0.80, 0.50, 2)
+    elseif iconName == "chevron-down" then
+        seg(0.24, 0.36, 0.50, 0.64, 2)
+        seg(0.50, 0.64, 0.76, 0.36, 2)
+    elseif iconName == "send" then
+        seg(0.16, 0.30, 0.86, 0.50, 2)
+        seg(0.86, 0.50, 0.16, 0.76, 2)
+        seg(0.16, 0.52, 0.86, 0.50, 1.8)
+    elseif iconName == "chart" then
+        seg(0.24, 0.80, 0.24, 0.54, 3)
+        seg(0.50, 0.80, 0.50, 0.36, 3)
+        seg(0.76, 0.80, 0.76, 0.20, 3)
+    end
+
+    return holder
+end
+
+-- // DOKUNULAN YERDE İZ ÇIKMASI (TOUCH / CLICK RIPPLE TRAIL)
+local function SpawnTouchRipple(x, y)
+    if not OrbitConfig.RippleEnabled then return end
+    local ripple = Instance.new("Frame")
+    ripple.Name = "OrbitTouchRipple"
+    ripple.AnchorPoint = Vector2.new(0.5, 0.5)
+    ripple.Position = UDim2.new(0, x, 0, y)
+    ripple.Size = UDim2.new(0, 8, 0, 8)
+    ripple.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+    ripple.BackgroundTransparency = 0.65
+    ripple.BorderSizePixel = 0
+    ripple.ZIndex = 999
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(1, 0)
+    c.Parent = ripple
+    local st = Instance.new("UIStroke")
+    st.Color = Color3.fromRGB(186, 230, 253)
+    st.Thickness = 1.8
+    st.Transparency = 0.15
+    st.Parent = ripple
+    ripple.Parent = ScreenGui
+
+    local tw = TweenService:Create(ripple, TweenInfo.new(0.48, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, 68, 0, 68),
+        BackgroundTransparency = 1
+    })
+    TweenService:Create(st, TweenInfo.new(0.48, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Transparency = 1
+    }):Play()
+    tw:Play()
+    task.delay(0.5, function()
+        if ripple and ripple.Parent then ripple:Destroy() end
+    end)
+end
+
+UserInputService.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        local pos = UserInputService:GetMouseLocation()
+        SpawnTouchRipple(pos.X, pos.Y)
+    end
+end)
+
+-- // YAYLI BUTON EFEKTİ (Tıklayınca Küçülüp Bırakınca Anlık Büyüme + Ses)
+local function AttachSpringEffect(btn, clickCallback, soundType)
+    local scale = Instance.new("UIScale")
+    scale.Scale = 1
+    scale.Parent = btn
+
+    btn.MouseButton1Down:Connect(function()
+        PlaySound(soundType or "Click", 0.98)
+        TweenService:Create(scale, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+            Scale = 0.92
+        }):Play()
+    end)
+
+    btn.MouseButton1Up:Connect(function()
+        TweenService:Create(scale, TweenInfo.new(0.16, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+            Scale = 1.04
+        }):Play()
+        task.delay(0.14, function()
+            if scale and scale.Parent then
+                TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+                    Scale = 1
+                }):Play()
+            end
+        end)
+    end)
+
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+            Scale = 1
+        }):Play()
+    end)
+
+    if clickCallback then
+        btn.MouseButton1Click:Connect(clickCallback)
+    end
+end
+
+-- // P2P ANIMATE KANALI MİMARİSİ (Humanoid.Animator AnimationTrack Replikasyonu)
+local P2PEngine = {}
+P2PEngine.CarrierTrack = nil
+P2PEngine.ShowBanner = nil
+
+function P2PEngine.GetCarrierTrack()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = hum
+    end
+
+    if not P2PEngine.CarrierTrack or not P2PEngine.CarrierTrack.Parent then
+        local anim = Instance.new("Animation")
+        anim.AnimationId = OrbitConfig.CarrierAnimationId
+        local ok, tr = pcall(function()
+            return animator:LoadAnimation(anim)
+        end)
+        if ok and tr then
+            tr.Priority = Enum.AnimationPriority.Action
+            P2PEngine.CarrierTrack = tr
+        end
+    end
+    return P2PEngine.CarrierTrack
+end
+
+-- OpCode'ları:
+-- 1 = Global P2P Duyuru / Handshake
+-- 2 = Bring (Hedefi Yanına Çek)
+-- 3 = Freeze / Thaw (Hedefi Dondur / Çöz)
+-- 4 = Fling (Hedefi Havaya Savur)
+-- 5 = Görsel Aura Efekti (Orbit Halkası)
+-- 6 = Kick (İstemci Oturum İzolasyonu)
+-- 7 = Saat / Yerçekimi Ortam Senkronizasyonu
+-- 8 = P2P Peer Discovery (Keşif Sinyali)
+function P2PEngine.Broadcast(opCode, targetPlayer, extraValue)
+    local track = P2PEngine.GetCarrierTrack()
+    local targetHash = 0
+    local targetName = "ALL"
+    if targetPlayer and typeof(targetPlayer) == "Instance" and targetPlayer:IsA("Player") then
+        targetHash = (targetPlayer.UserId % 80) + 10
+        targetName = targetPlayer.Name
+    else
+        targetHash = 95 -- 95 = ALL
+    end
+
+    local encodedTimePos = opCode + (targetHash / 100)
+    local encodedSpeed = 1.15 + ((opCode % 7) * 0.25)
+    local encodedWeight = math.clamp((extraValue or 50) / 100, 0.1, 0.99)
+
+    if track then
+        pcall(function()
+            track:Play(0.05, encodedWeight, encodedSpeed)
+            track.TimePosition = encodedTimePos
+            task.delay(0.35, function()
+                if track and track.IsPlaying then
+                    track:Stop(0.1)
+                end
+            end)
+        end)
+    end
+
+    PlaySound("Broadcast", 1.04)
+    AddLog(
+        string.format("P2P_TX[0x0%d]", opCode),
+        LocalPlayer.Name,
+        string.format("Hedef: %s | TP: %.2f | Spd: %.2f | W: %.2f", targetName, encodedTimePos, encodedSpeed, encodedWeight)
+    )
+end
+
+-- Diğer oyuncularda görsel vektörel halka (Aura) oluşturucu
+local function ApplyPeerAura(player, enabled)
+    if not player or not player.Character then return end
+    local root = player.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local existing = root:FindFirstChild("OrbitP2PAura")
+    if not enabled then
+        if existing then existing:Destroy() end
+        return
+    end
+    if existing then return end
+
+    local bg = Instance.new("BillboardGui")
+    bg.Name = "OrbitP2PAura"
+    bg.Size = UDim2.new(6, 0, 6, 0)
+    bg.AlwaysOnTop = false
+    bg.Parent = root
+
+    VectorCanvas.DrawCircleRing(bg, 0.5, 0.5, 0.42, 2.5, Color3.fromRGB(56, 189, 248), false, 3)
+    VectorCanvas.DrawCircleRing(bg, 0.5, 0.5, 0.30, 1.5, Color3.fromRGB(168, 85, 247), false, 3)
+end
+
+-- Gelen P2P sinyallerini çöz ve uygula
+local function HandleIncomingP2PFrame(sender, opCode, targetHash, weightVal)
+    OrbitState.VerifiedPeers[sender.UserId] = true
+    if RefreshPeersUI then pcall(RefreshPeersUI) end
+
+    local myHash = (LocalPlayer.UserId % 80) + 10
+    local isForMe = (targetHash == 95) or (math.abs(targetHash - myHash) <= 1)
+
+    AddLog(
+        string.format("P2P_RX[0x0%d]", opCode),
+        sender.Name,
+        string.format("Peer sinyali alındı (HedefHash: %d, W: %.2f)", targetHash, weightVal)
+    )
+
+    if opCode == 1 and P2PEngine.ShowBanner then
+        P2PEngine.ShowBanner(sender.Name, "ORBIT P2P Senkron Sinyali & Sunucu Duyurusu!")
+    elseif opCode == 2 and isForMe then
+        -- Bring: Gönderen adminin yanına ışınlan
+        if sender.Character and sender.Character:FindFirstChild("HumanoidRootPart") and LocalPlayer.Character then
+            LocalPlayer.Character:PivotTo(sender.Character.HumanoidRootPart.CFrame * CFrame.new(0, 0, -4))
+        end
+    elseif opCode == 3 and isForMe then
+        -- Freeze / Thaw
+        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            local r = LocalPlayer.Character.HumanoidRootPart
+            r.Anchored = not r.Anchored
+        end
+    elseif opCode == 4 and isForMe then
+        -- Fling
+        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            LocalPlayer.Character.HumanoidRootPart.AssemblyLinearVelocity = Vector3.new(math.random(-180, 180), 280, math.random(-180, 180))
+        end
+    elseif opCode == 5 then
+        ApplyPeerAura(sender, true)
+    elseif opCode == 6 and isForMe and sender ~= LocalPlayer then
+        if P2PEngine.ShowBanner then
+            P2PEngine.ShowBanner(sender.Name, "P2P Moderasyon Uyarısı Aldınız!")
+        end
+    elseif opCode == 7 then
+        Lighting.ClockTime = math.clamp( math.floor(weightVal * 24), 0, 24 )
+    end
+end
+
+function P2PEngine.WatchPeer(plr)
+    if plr == LocalPlayer then return end
+
+    local function BindChar(char)
+        local hum = char:WaitForChild("Humanoid", 8)
+        if not hum then return end
+        local animator = hum:WaitForChild("Animator", 8)
+        if not animator then return end
+
+        animator.AnimationPlayed:Connect(function(track)
+            if not track or not track.Animation then return end
+            local animId = tostring(track.Animation.AnimationId)
+            if string.find(animId, "507766388") or animId == OrbitConfig.CarrierAnimationId then
+                task.wait(0.04)
+                local tp = track.TimePosition
+                local opCode = math.floor(tp + 0.001)
+                local targetHash = math.floor(((tp - opCode) * 100) + 0.5)
+                if opCode >= 1 and opCode <= 8 then
+                    HandleIncomingP2PFrame(plr, opCode, targetHash, track.WeightCurrent)
+                end
+            end
+        end)
+    end
+
+    if plr.Character then task.spawn(BindChar, plr.Character) end
+    plr.CharacterAdded:Connect(BindChar)
+
+    -- Chat üzerinden [ORBIT] duyuru mesajlarını da yakala
+    plr.Chatted:Connect(function(msg)
+        if string.sub(msg, 1, 7) == "[ORBIT]" then
+            OrbitState.VerifiedPeers[plr.UserId] = true
+            local cleanText = string.sub(msg, 9)
+            if P2PEngine.ShowBanner then
+                P2PEngine.ShowBanner(plr.Name, cleanText)
+            end
+        end
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    P2PEngine.WatchPeer(p)
+end
+Players.PlayerAdded:Connect(function(p)
+    P2PEngine.WatchPeer(p)
+    if RefreshPeersUI then pcall(RefreshPeersUI) end
+end)
+Players.PlayerRemoving:Connect(function()
+    if RefreshPeersUI then pcall(RefreshPeersUI) end
+end)
+
+-- // P2P DUYURU BANNER ARAYÜZÜ
+local BannerFrame = Instance.new("Frame")
+BannerFrame.Name = "P2PBanner"
+BannerFrame.AnchorPoint = Vector2.new(0.5, 0)
+BannerFrame.Position = UDim2.new(0.5, 0, 0, -90)
+BannerFrame.Size = UDim2.new(0, 460, 0, 58)
+BannerFrame.BackgroundColor3 = Color3.fromRGB(22, 27, 36)
+BannerFrame.BackgroundTransparency = 0.06
+BannerFrame.BorderSizePixel = 0
+BannerFrame.ZIndex = 60
+BannerFrame.Parent = ScreenGui
+Instance.new("UICorner", BannerFrame).CornerRadius = UDim.new(0, 14)
+local bStroke = Instance.new("UIStroke", BannerFrame)
+bStroke.Color = Color3.fromRGB(56, 189, 248)
+bStroke.Thickness = 1.4
+
+local BannerTitle = Instance.new("TextLabel")
+BannerTitle.BackgroundTransparency = 1
+BannerTitle.Position = UDim2.new(0, 16, 0, 8)
+BannerTitle.Size = UDim2.new(1, -32, 0, 16)
+BannerTitle.Font = Enum.Font.GothamBold
+BannerTitle.TextSize = 11
+BannerTitle.TextColor3 = Color3.fromRGB(56, 189, 248)
+BannerTitle.TextXAlignment = Enum.TextXAlignment.Left
+BannerTitle.Text = "P2P SUNUCU DUYURUSU"
+BannerTitle.ZIndex = 61
+BannerTitle.Parent = BannerFrame
+
+local BannerBody = Instance.new("TextLabel")
+BannerBody.BackgroundTransparency = 1
+BannerBody.Position = UDim2.new(0, 16, 0, 26)
+BannerBody.Size = UDim2.new(1, -32, 0, 22)
+BannerBody.Font = Enum.Font.GothamSemibold
+BannerBody.TextSize = 13
+BannerBody.TextColor3 = Color3.fromRGB(248, 250, 252)
+BannerBody.TextXAlignment = Enum.TextXAlignment.Left
+BannerBody.Text = ""
+BannerBody.ZIndex = 61
+BannerBody.Parent = BannerFrame
+
+P2PEngine.ShowBanner = function(senderName, text)
+    BannerTitle.Text = "P2P DUYURU • GÖNDEREN: " .. string.upper(tostring(senderName))
+    BannerBody.Text = tostring(text)
+    PlaySound("Broadcast", 1.0)
+    TweenService:Create(BannerFrame, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0.5, 0, 0, 18)
+    }):Play()
+    task.delay(5, function()
+        if BannerFrame and BannerFrame.Parent then
+            TweenService:Create(BannerFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+                Position = UDim2.new(0.5, 0, 0, -90)
+            }):Play()
+        end
+    end)
+end
+
+-- // SAĞ ÜST ADMİN BUTONU (3 Saniye Sonra Sağdan Kayarak Gelir)
+local AdminToggleBtn = Instance.new("TextButton")
+AdminToggleBtn.Name = "RightSlideAdminButton"
+AdminToggleBtn.Text = ""
+AdminToggleBtn.AutoButtonColor = false
+AdminToggleBtn.AnchorPoint = Vector2.new(1, 0)
+-- Başlangıçta ekranın sağ dışında (Offset +180)
+AdminToggleBtn.Position = UDim2.new(1, 180, 0, 56)
+AdminToggleBtn.Size = UDim2.new(0, 118, 0, 40)
+AdminToggleBtn.BackgroundColor3 = Color3.fromRGB(32, 38, 48)
+AdminToggleBtn.BackgroundTransparency = 0.08
+AdminToggleBtn.BorderSizePixel = 0
+AdminToggleBtn.ZIndex = 50
+AdminToggleBtn.Parent = ScreenGui
+Instance.new("UICorner", AdminToggleBtn).CornerRadius = UDim.new(0, 12)
+local admStroke = Instance.new("UIStroke", AdminToggleBtn)
+admStroke.Color = Color3.fromRGB(255, 255, 255)
+admStroke.Transparency = 0.82
+admStroke.Thickness = 1
+
+local CrownIcon = VectorCanvas.CreateIcon(AdminToggleBtn, "crown", 16, Color3.fromRGB(248, 250, 252), 52)
+CrownIcon.Position = UDim2.new(0, 14, 0.5, -8)
+
+local AdminBtnLabel = Instance.new("TextLabel")
+AdminBtnLabel.BackgroundTransparency = 1
+AdminBtnLabel.Position = UDim2.new(0, 38, 0, 0)
+AdminBtnLabel.Size = UDim2.new(0, 52, 1, 0)
+AdminBtnLabel.Font = Enum.Font.GothamBold
+AdminBtnLabel.Text = "Admin"
+AdminBtnLabel.TextSize = 13
+AdminBtnLabel.TextColor3 = Color3.fromRGB(248, 250, 252)
+AdminBtnLabel.TextXAlignment = Enum.TextXAlignment.Left
+AdminBtnLabel.ZIndex = 52
+AdminBtnLabel.Parent = AdminToggleBtn
+
+local ChevIcon = VectorCanvas.CreateIcon(AdminToggleBtn, "chevron-down", 14, Color3.fromRGB(180, 190, 205), 52)
+ChevIcon.Position = UDim2.new(1, -26, 0.5, -7)
+
+-- // EKRAN KARARTMA (DIM) & KULLANIM TALİMATLARI / TANITIM PENCERESİ
+local DimOverlay = Instance.new("Frame")
+DimOverlay.Name = "IntroDimOverlay"
+DimOverlay.Size = UDim2.new(1, 0, 1, 0)
+DimOverlay.BackgroundColor3 = Color3.fromRGB(6, 9, 15)
+DimOverlay.BackgroundTransparency = 1
+DimOverlay.Visible = false
+DimOverlay.ZIndex = 40
+DimOverlay.Parent = ScreenGui
+
+local IntroCard = Instance.new("Frame")
+IntroCard.Name = "OnboardingCard"
+IntroCard.AnchorPoint = Vector2.new(0.5, 0.5)
+IntroCard.Position = UDim2.new(0.5, 0, 0.5, 0)
+IntroCard.Size = UDim2.new(0, 520, 0, 340)
+IntroCard.BackgroundColor3 = Color3.fromRGB(22, 26, 34)
+IntroCard.BorderSizePixel = 0
+IntroCard.ZIndex = 42
+IntroCard.Parent = DimOverlay
+Instance.new("UICorner", IntroCard).CornerRadius = UDim.new(0, 18)
+local icStroke = Instance.new("UIStroke", IntroCard)
+icStroke.Color = Color3.fromRGB(255, 255, 255)
+icStroke.Transparency = 0.85
+
+local IntroTitle = Instance.new("TextLabel")
+IntroTitle.BackgroundTransparency = 1
+IntroTitle.Position = UDim2.new(0, 24, 0, 20)
+IntroTitle.Size = UDim2.new(1, -48, 0, 26)
+IntroTitle.Font = Enum.Font.GothamBold
+IntroTitle.TextSize = 18
+IntroTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+IntroTitle.TextXAlignment = Enum.TextXAlignment.Left
+IntroTitle.Text = "🪐 ORBIT P2P LocalScript Admin — Hoş Geldin!"
+IntroTitle.ZIndex = 43
+IntroTitle.Parent = IntroCard
+
+local IntroDesc = Instance.new("TextLabel")
+IntroDesc.BackgroundTransparency = 1
+IntroDesc.Position = UDim2.new(0, 24, 0, 54)
+IntroDesc.Size = UDim2.new(1, -48, 0, 210)
+IntroDesc.Font = Enum.Font.Gotham
+IntroDesc.TextSize = 13
+IntroDesc.TextColor3 = Color3.fromRGB(203, 213, 225)
+IntroDesc.TextXAlignment = Enum.TextXAlignment.Left
+IntroDesc.TextYAlignment = Enum.TextYAlignment.Top
+IntroDesc.TextWrapped = true
+IntroDesc.Text = "1. P2P ANIMATE MİMARİSİ:
+Sunucu tarafında hiçbir RemoteEvent gerektirmeden Humanoid.Animator kanallarını kullanarak diğer tüm ORBIT kullanıcılarıyla gerçek zamanlı haberleşir. Duyurular, Bring, Freeze, Fling ve Aura efektleri tüm P2P oyuncularda çalışır.
+
+2. VEKTÖREL SİMGELER & BOYUTLANDIRILABİLİR GUI:
+Tüm simgeler saf vektörel çizimle oluşturulmuştur. Sağ üstteki 'Admin' butonu ile menüyü istediğiniz an açıp kapatabilir, sağ alt köşeden boyutu değiştirebilirsiniz.
+
+3. MOBİL & PC HAREKET MOTORU:
+LinearVelocity + AlignOrientation tabanlı sarsıntısız Fly, Stepped Noclip ve Vektörel 2D ESP dahildir."
+IntroDesc.ZIndex = 43
+IntroDesc.Parent = IntroCard
+
+local IntroStartBtn = Instance.new("TextButton")
+IntroStartBtn.Name = "StartOrbitBtn"
+IntroStartBtn.AnchorPoint = Vector2.new(1, 1)
+IntroStartBtn.Position = UDim2.new(1, -24, 1, -20)
+IntroStartBtn.Size = UDim2.new(0, 210, 0, 40)
+IntroStartBtn.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+IntroStartBtn.Font = Enum.Font.GothamBold
+IntroStartBtn.TextSize = 13
+IntroStartBtn.TextColor3 = Color3.fromRGB(10, 15, 25)
+IntroStartBtn.Text = "Anladım, ORBIT Paneli Aç →"
+IntroStartBtn.AutoButtonColor = false
+IntroStartBtn.ZIndex = 44
+IntroStartBtn.Parent = IntroCard
+Instance.new("UICorner", IntroStartBtn).CornerRadius = UDim.new(0, 10)
+
+-- // ANA ORBIT PENCERESİ (GÖRSELDEKİ TASARIMLA BİREBİR)
+local MainWin = Instance.new("Frame")
+MainWin.Name = "OrbitMainWindow"
+MainWin.AnchorPoint = Vector2.new(0.5, 0.5)
+MainWin.Position = UDim2.new(0.5, 0, 0.52, 0)
+MainWin.Size = UDim2.new(0, OrbitConfig.WinWidth, 0, OrbitConfig.WinHeight)
+MainWin.BackgroundColor3 = Color3.fromRGB(23, 27, 34)
+MainWin.BackgroundTransparency = 0.06
+MainWin.BorderSizePixel = 0
+MainWin.Visible = false
+MainWin.ClipsDescendants = true
+MainWin.ZIndex = 20
+MainWin.Parent = ScreenGui
+Instance.new("UICorner", MainWin).CornerRadius = UDim.new(0, 18)
+local mwStroke = Instance.new("UIStroke", MainWin)
+mwStroke.Color = Color3.fromRGB(255, 255, 255)
+mwStroke.Transparency = 0.88
+mwStroke.Thickness = 1
+
+-- Üst Başlık Çubuğu (Sürüklenebilir)
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, 42)
+TopBar.BackgroundColor3 = Color3.fromRGB(28, 33, 42)
+TopBar.BorderSizePixel = 0
+TopBar.ZIndex = 21
+TopBar.Parent = MainWin
+
+-- Sol Pencere Kontrolleri (Kapat, Menü Daralt, Tam Boyut)
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.BackgroundTransparency = 1
+CloseBtn.Position = UDim2.new(0, 12, 0.5, -12)
+CloseBtn.Size = UDim2.new(0, 24, 0, 24)
+CloseBtn.Text = ""
+CloseBtn.ZIndex = 22
+CloseBtn.Parent = TopBar
+VectorCanvas.CreateIcon(CloseBtn, "close", 15, Color3.fromRGB(165, 175, 190), 23).Position = UDim2.new(0.5, -7, 0.5, -7)
+
+local CollapseBtn = Instance.new("TextButton")
+CollapseBtn.BackgroundTransparency = 1
+CollapseBtn.Position = UDim2.new(0, 42, 0.5, -12)
+CollapseBtn.Size = UDim2.new(0, 24, 0, 24)
+CollapseBtn.Text = ""
+CollapseBtn.ZIndex = 22
+CollapseBtn.Parent = TopBar
+VectorCanvas.CreateIcon(CollapseBtn, "menu", 15, Color3.fromRGB(165, 175, 190), 23).Position = UDim2.new(0.5, -7, 0.5, -7)
+
+local MaxBtn = Instance.new("TextButton")
+MaxBtn.BackgroundTransparency = 1
+MaxBtn.Position = UDim2.new(0, 72, 0.5, -12)
+MaxBtn.Size = UDim2.new(0, 24, 0, 24)
+MaxBtn.Text = ""
+MaxBtn.ZIndex = 22
+MaxBtn.Parent = TopBar
+VectorCanvas.CreateIcon(MaxBtn, "maximize", 15, Color3.fromRGB(165, 175, 190), 23).Position = UDim2.new(0.5, -7, 0.5, -7)
+
+-- Orta Tutamaç Çizgisi
+local DragPill = Instance.new("Frame")
+DragPill.AnchorPoint = Vector2.new(0.5, 0.5)
+DragPill.Position = UDim2.new(0.5, 0, 0.5, 0)
+DragPill.Size = UDim2.new(0, 44, 0, 5)
+DragPill.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+DragPill.BackgroundTransparency = 0.78
+DragPill.BorderSizePixel = 0
+DragPill.ZIndex = 22
+DragPill.Parent = TopBar
+Instance.new("UICorner", DragPill).CornerRadius = UDim.new(1, 0)
+
+-- Sağ ORBIT Logo ve Zil İkonu
+local OrbitLogoIcon = VectorCanvas.CreateIcon(TopBar, "orbit", 18, Color3.fromRGB(240, 244, 250), 22)
+OrbitLogoIcon.Position = UDim2.new(1, -112, 0.5, -9)
+
+local OrbitBrandText = Instance.new("TextLabel")
+OrbitBrandText.BackgroundTransparency = 1
+OrbitBrandText.Position = UDim2.new(1, -88, 0, 0)
+OrbitBrandText.Size = UDim2.new(0, 48, 1, 0)
+OrbitBrandText.Font = Enum.Font.GothamBold
+OrbitBrandText.Text = "ORBIT"
+OrbitBrandText.TextSize = 12
+OrbitBrandText.TextColor3 = Color3.fromRGB(240, 244, 250)
+OrbitBrandText.TextXAlignment = Enum.TextXAlignment.Left
+OrbitBrandText.ZIndex = 22
+OrbitBrandText.Parent = TopBar
+
+local BellBtn = Instance.new("TextButton")
+BellBtn.BackgroundTransparency = 1
+BellBtn.Position = UDim2.new(1, -34, 0.5, -12)
+BellBtn.Size = UDim2.new(0, 24, 0, 24)
+BellBtn.Text = ""
+BellBtn.ZIndex = 22
+BellBtn.Parent = TopBar
+VectorCanvas.CreateIcon(BellBtn, "bell", 15, Color3.fromRGB(220, 228, 240), 23).Position = UDim2.new(0.5, -7, 0.5, -7)
+
+-- Pencere Sürükleme (Draggable) Mantığı
+do
+    local dragging = false
+    local dragStart = Vector2.new(0, 0)
+    local startPos = MainWin.Position
+
+    TopBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            startPos = MainWin.Position
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+            MainWin.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+-- Sağ Alt Köşe Boyutlandırma (Resizable GUI) Tutamacı
+local ResizeGrip = Instance.new("TextButton")
+ResizeGrip.Name = "ResizeGrip"
+ResizeGrip.AnchorPoint = Vector2.new(1, 1)
+ResizeGrip.Position = UDim2.new(1, -4, 1, -4)
+ResizeGrip.Size = UDim2.new(0, 22, 0, 22)
+ResizeGrip.BackgroundTransparency = 1
+ResizeGrip.Text = "◢"
+ResizeGrip.Font = Enum.Font.GothamBold
+ResizeGrip.TextSize = 13
+ResizeGrip.TextColor3 = Color3.fromRGB(148, 163, 184)
+ResizeGrip.ZIndex = 30
+ResizeGrip.Parent = MainWin
+
+do
+    local resizing = false
+    local resizeStart = Vector2.new(0, 0)
+    local startSize = Vector2.new(OrbitConfig.WinWidth, OrbitConfig.WinHeight)
+
+    ResizeGrip.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            resizing = true
+            resizeStart = Vector2.new(input.Position.X, input.Position.Y)
+            startSize = Vector2.new(MainWin.AbsoluteSize.X, MainWin.AbsoluteSize.Y)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = Vector2.new(input.Position.X, input.Position.Y) - resizeStart
+            local nw = math.clamp(startSize.X + delta.X, OrbitConfig.MinWidth, OrbitConfig.MaxWidth)
+            local nh = math.clamp(startSize.Y + delta.Y, OrbitConfig.MinHeight, OrbitConfig.MaxHeight)
+            OrbitConfig.WinWidth = nw
+            OrbitConfig.WinHeight = nh
+            MainWin.Size = UDim2.new(0, nw, 0, nh)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            resizing = false
+        end
+    end)
+end
+
+-- // SOL KENAR ÇUBUĞU (SIDEBAR - 9 SEKME + PROFİL KARTI)
+local Sidebar = Instance.new("Frame")
+Sidebar.Name = "Sidebar"
+Sidebar.Position = UDim2.new(0, 0, 0, 42)
+Sidebar.Size = UDim2.new(0, 210, 1, -42)
+Sidebar.BackgroundColor3 = Color3.fromRGB(20, 24, 31)
+Sidebar.BorderSizePixel = 0
+Sidebar.ZIndex = 21
+Sidebar.Parent = MainWin
+
+local NavList = Instance.new("ScrollingFrame")
+NavList.Position = UDim2.new(0, 10, 0, 10)
+NavList.Size = UDim2.new(1, -20, 1, -80)
+NavList.BackgroundTransparency = 1
+NavList.BorderSizePixel = 0
+NavList.ScrollBarThickness = 2
+NavList.CanvasSize = UDim2.new(0, 0, 0, 360)
+NavList.ZIndex = 22
+NavList.Parent = Sidebar
+
+local NavLayout = Instance.new("UIListLayout")
+NavLayout.Padding = UDim.new(0, 4)
+NavLayout.SortOrder = Enum.SortOrder.LayoutOrder
+NavLayout.Parent = NavList
+
+-- Sol Alt Oyuncu Profil Kartı
+local ProfileCard = Instance.new("Frame")
+ProfileCard.AnchorPoint = Vector2.new(0.5, 1)
+ProfileCard.Position = UDim2.new(0.5, 0, 1, -10)
+ProfileCard.Size = UDim2.new(1, -20, 0, 54)
+ProfileCard.BackgroundColor3 = Color3.fromRGB(28, 33, 42)
+ProfileCard.BorderSizePixel = 0
+ProfileCard.ZIndex = 22
+ProfileCard.Parent = Sidebar
+Instance.new("UICorner", ProfileCard).CornerRadius = UDim.new(0, 12)
+local pcStroke = Instance.new("UIStroke", ProfileCard)
+pcStroke.Color = Color3.fromRGB(255, 255, 255)
+pcStroke.Transparency = 0.9
+
+local AvatarCircle = Instance.new("Frame")
+AvatarCircle.Position = UDim2.new(0, 10, 0.5, -17)
+AvatarCircle.Size = UDim2.new(0, 34, 0, 34)
+AvatarCircle.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+AvatarCircle.BorderSizePixel = 0
+AvatarCircle.ZIndex = 23
+AvatarCircle.Parent = ProfileCard
+Instance.new("UICorner", AvatarCircle).CornerRadius = UDim.new(1, 0)
+
+local AvatarInitials = Instance.new("TextLabel")
+AvatarInitials.Size = UDim2.new(1, 0, 1, 0)
+AvatarInitials.BackgroundTransparency = 1
+AvatarInitials.Font = Enum.Font.GothamBold
+AvatarInitials.TextSize = 13
+AvatarInitials.TextColor3 = Color3.fromRGB(15, 23, 42)
+AvatarInitials.Text = string.upper(string.sub(LocalPlayer.DisplayName or LocalPlayer.Name, 1, 2))
+AvatarInitials.ZIndex = 24
+AvatarInitials.Parent = AvatarCircle
+
+local ProfileNameLbl = Instance.new("TextLabel")
+ProfileNameLbl.BackgroundTransparency = 1
+ProfileNameLbl.Position = UDim2.new(0, 52, 0, 10)
+ProfileNameLbl.Size = UDim2.new(1, -64, 0, 16)
+ProfileNameLbl.Font = Enum.Font.GothamBold
+ProfileNameLbl.TextSize = 12
+ProfileNameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+ProfileNameLbl.TextXAlignment = Enum.TextXAlignment.Left
+ProfileNameLbl.Text = LocalPlayer.DisplayName or LocalPlayer.Name
+ProfileNameLbl.ZIndex = 23
+ProfileNameLbl.Parent = ProfileCard
+
+local ProfileHandleLbl = Instance.new("TextLabel")
+ProfileHandleLbl.BackgroundTransparency = 1
+ProfileHandleLbl.Position = UDim2.new(0, 52, 0, 27)
+ProfileHandleLbl.Size = UDim2.new(1, -64, 0, 15)
+ProfileHandleLbl.Font = Enum.Font.Gotham
+ProfileHandleLbl.TextSize = 11
+ProfileHandleLbl.TextColor3 = Color3.fromRGB(148, 163, 184)
+ProfileHandleLbl.TextXAlignment = Enum.TextXAlignment.Left
+ProfileHandleLbl.Text = "@" .. LocalPlayer.Name
+ProfileHandleLbl.ZIndex = 23
+ProfileHandleLbl.Parent = ProfileCard
+
+-- // SAĞ İÇERİK ALANI (CONTENT CONTAINER)
+local ContentArea = Instance.new("Frame")
+ContentArea.Name = "ContentArea"
+ContentArea.Position = UDim2.new(0, 210, 0, 42)
+ContentArea.Size = UDim2.new(1, -210, 1, -42)
+ContentArea.BackgroundTransparency = 1
+ContentArea.ZIndex = 21
+ContentArea.Parent = MainWin
+
+local TabDefinitions = {
+    { Name = "Ana Panel", Icon = "home" },
+    { Name = "Oyuncu Yönetimi", Icon = "users" },
+    { Name = "Hareket Kontrolleri", Icon = "run" },
+    { Name = "Teleport", Icon = "pin" },
+    { Name = "Kick / Ban", Icon = "ban" },
+    { Name = "Sunucu Yönetimi", Icon = "server" },
+    { Name = "Komut Sistemi", Icon = "code" },
+    { Name = "Ekstra Araçlar", Icon = "wrench" },
+    { Name = "Ayarlar", Icon = "settings" }
+}
+
+local TabPages = {}
+local TabButtons = {}
+
+local function SwitchToTab(tabName)
+    OrbitState.ActiveTab = tabName
+    for name, page in pairs(TabPages) do
+        page.Visible = (name == tabName)
+    end
+    for name, btnData in pairs(TabButtons) do
+        local isAct = (name == tabName)
+        TweenService:Create(btnData.Button, TweenInfo.new(0.15), {
+            BackgroundColor3 = isAct and Color3.fromRGB(37, 43, 53) or Color3.fromRGB(20, 24, 31),
+            BackgroundTransparency = isAct and 0 or 1
+        }):Play()
+        btnData.Stroke.Transparency = isAct and 0.82 or 1
+        btnData.Label.TextColor3 = isAct and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 185)
+    end
+end
+
+for idx, def in ipairs(TabDefinitions) do
+    local tBtn = Instance.new("TextButton")
+    tBtn.Name = "TabBtn_" .. def.Name
+    tBtn.LayoutOrder = idx
+    tBtn.Size = UDim2.new(1, 0, 0, 36)
+    tBtn.BackgroundColor3 = Color3.fromRGB(37, 43, 53)
+    tBtn.BackgroundTransparency = (idx == 1) and 0 or 1
+    tBtn.BorderSizePixel = 0
+    tBtn.AutoButtonColor = false
+    tBtn.Text = ""
+    tBtn.ZIndex = 23
+    tBtn.Parent = NavList
+    Instance.new("UICorner", tBtn).CornerRadius = UDim.new(0, 10)
+    local st = Instance.new("UIStroke", tBtn)
+    st.Color = Color3.fromRGB(255, 255, 255)
+    st.Transparency = (idx == 1) and 0.82 or 1
+
+    local ic = VectorCanvas.CreateIcon(tBtn, def.Icon, 16, Color3.fromRGB(230, 236, 245), 24)
+    ic.Position = UDim2.new(0, 12, 0.5, -8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.BackgroundTransparency = 1
+    lbl.Position = UDim2.new(0, 36, 0, 0)
+    lbl.Size = UDim2.new(1, -44, 1, 0)
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 12
+    lbl.TextColor3 = (idx == 1) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 170, 185)
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = def.Name
+    lbl.ZIndex = 24
+    lbl.Parent = tBtn
+
+    local page = Instance.new("ScrollingFrame")
+    page.Name = "Page_" .. def.Name
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.CanvasSize = UDim2.new(0, 0, 0, 480)
+    page.Visible = (idx == 1)
+    page.ZIndex = 22
+    page.Parent = ContentArea
+
+    TabPages[def.Name] = page
+    TabButtons[def.Name] = { Button = tBtn, Stroke = st, Label = lbl }
+
+    AttachSpringEffect(tBtn, function()
+        SwitchToTab(def.Name)
+    end, "Tab")
+end
+
+-- Yardımcı Kart Oluşturucu
+local function CreateSectionCard(parent, pos, size)
+    local card = Instance.new("Frame")
+    card.Position = pos
+    card.Size = size
+    card.BackgroundColor3 = Color3.fromRGB(32, 37, 46)
+    card.BackgroundTransparency = 0.12
+    card.BorderSizePixel = 0
+    card.ZIndex = 23
+    card.Parent = parent
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 14)
+    local st = Instance.new("UIStroke", card)
+    st.Color = Color3.fromRGB(255, 255, 255)
+    st.Transparency = 0.9
+    return card
+end
+
+-- // ==========================================================================
+-- // SEKME 1: ANA PANEL (Görseldeki Tasarımın Birebir Karşılığı)
+-- // ==========================================================================
+do
+    local page = TabPages["Ana Panel"]
+
+    local greet = Instance.new("TextLabel")
+    greet.BackgroundTransparency = 1
+    greet.Position = UDim2.new(0, 22, 0, 16)
+    greet.Size = UDim2.new(0.65, 0, 0, 26)
+    greet.Font = Enum.Font.GothamBold
+    greet.TextSize = 21
+    greet.TextColor3 = Color3.fromRGB(255, 255, 255)
+    greet.TextXAlignment = Enum.TextXAlignment.Left
+    greet.Text = "Hoş Geldin, " .. (LocalPlayer.DisplayName or LocalPlayer.Name) .. "!"
+    greet.ZIndex = 23
+    greet.Parent = page
+
+    local sub = Instance.new("TextLabel")
+    sub.BackgroundTransparency = 1
+    sub.Position = UDim2.new(0, 22, 0, 44)
+    sub.Size = UDim2.new(0.65, 0, 0, 16)
+    sub.Font = Enum.Font.Gotham
+    sub.TextSize = 12
+    sub.TextColor3 = Color3.fromRGB(155, 165, 180)
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Text = "Sunucunu yönetmek için aşağıdaki araçları kullanabilirsin."
+    sub.ZIndex = 23
+    sub.Parent = page
+
+    local dateLbl = Instance.new("TextLabel")
+    dateLbl.BackgroundTransparency = 1
+    dateLbl.Position = UDim2.new(1, -210, 0, 20)
+    dateLbl.Size = UDim2.new(0, 188, 0, 18)
+    dateLbl.Font = Enum.Font.GothamMedium
+    dateLbl.TextSize = 12
+    dateLbl.TextColor3 = Color3.fromRGB(155, 165, 180)
+    dateLbl.TextXAlignment = Enum.TextXAlignment.Right
+    dateLbl.Text = os.date("%d %B %Y • %H:%M")
+    dateLbl.ZIndex = 23
+    dateLbl.Parent = page
+
+    -- 6 Hızlı Erişim Kartı (2 Satır x 3 Sütun)
+    local quickCards = {
+        { Title = "Oyuncu Yönetimi", Sub = "Oyuncuları yönet", Icon = "users", Target = "Oyuncu Yönetimi" },
+        { Title = "Hareket Kontrolleri", Sub = "Fly, Noclip, Hız", Icon = "run", Target = "Hareket Kontrolleri" },
+        { Title = "Teleport", Sub = "Konum seç", Icon = "pin", Target = "Teleport" },
+        { Title = "Kick / Ban", Sub = "Oyuncuları cezalandır", Icon = "shield", Target = "Kick / Ban" },
+        { Title = "Sunucu Yönetimi", Sub = "Duyuru, ayarlar", Icon = "server", Target = "Sunucu Yönetimi" },
+        { Title = "Komut Sistemi", Sub = "Komutları kullan", Icon = "code", Target = "Komut Sistemi" }
+    }
+
+    for i, info in ipairs(quickCards) do
+        local col = (i - 1) % 3
+        local row = math.floor((i - 1) / 3)
+        local xScale = col * 0.32
+        local yOff = 74 + (row * 102)
+
+        local qBtn = Instance.new("TextButton")
+        qBtn.Position = UDim2.new(xScale, 22, 0, yOff)
+        qBtn.Size = UDim2.new(0.30, -8, 0, 92)
+        qBtn.BackgroundColor3 = Color3.fromRGB(32, 37, 46)
+        qBtn.BackgroundTransparency = 0.1
+        qBtn.BorderSizePixel = 0
+        qBtn.AutoButtonColor = false
+        qBtn.Text = ""
+        qBtn.ZIndex = 23
+        qBtn.Parent = page
+        Instance.new("UICorner", qBtn).CornerRadius = UDim.new(0, 14)
+        local qSt = Instance.new("UIStroke", qBtn)
+        qSt.Color = Color3.fromRGB(255, 255, 255)
+        qSt.Transparency = 0.89
+
+        local ic = VectorCanvas.CreateIcon(qBtn, info.Icon, 20, Color3.fromRGB(240, 244, 250), 24)
+        ic.Position = UDim2.new(0, 14, 0, 14)
+
+        local qt = Instance.new("TextLabel")
+        qt.BackgroundTransparency = 1
+        qt.Position = UDim2.new(0, 14, 0, 44)
+        qt.Size = UDim2.new(1, -50, 0, 18)
+        qt.Font = Enum.Font.GothamBold
+        qt.TextSize = 13
+        qt.TextColor3 = Color3.fromRGB(255, 255, 255)
+        qt.TextXAlignment = Enum.TextXAlignment.Left
+        qt.Text = info.Title
+        qt.ZIndex = 24
+        qt.Parent = qBtn
+
+        local qs = Instance.new("TextLabel")
+        qs.BackgroundTransparency = 1
+        qs.Position = UDim2.new(0, 14, 0, 63)
+        qs.Size = UDim2.new(1, -50, 0, 15)
+        qs.Font = Enum.Font.Gotham
+        qs.TextSize = 11
+        qs.TextColor3 = Color3.fromRGB(148, 163, 184)
+        qs.TextXAlignment = Enum.TextXAlignment.Left
+        qs.Text = info.Sub
+        qs.ZIndex = 24
+        qs.Parent = qBtn
+
+        local arrCircle = Instance.new("Frame")
+        arrCircle.AnchorPoint = Vector2.new(1, 1)
+        arrCircle.Position = UDim2.new(1, -12, 1, -12)
+        arrCircle.Size = UDim2.new(0, 26, 0, 26)
+        arrCircle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        arrCircle.BackgroundTransparency = 0.92
+        arrCircle.BorderSizePixel = 0
+        arrCircle.ZIndex = 24
+        arrCircle.Parent = qBtn
+        Instance.new("UICorner", arrCircle).CornerRadius = UDim.new(1, 0)
+        VectorCanvas.CreateIcon(arrCircle, "arrow-right", 13, Color3.fromRGB(210, 220, 235), 25).Position = UDim2.new(0.5, -6, 0.5, -6)
+
+        AttachSpringEffect(qBtn, function()
+            SwitchToTab(info.Target)
+        end, "Tab")
+    end
+
+    -- Alt Sol: Sunucu Duyurusu Kartı
+    local AnnCard = CreateSectionCard(page, UDim2.new(0, 22, 0, 284), UDim2.new(0.56, -16, 0, 168))
+
+    local AnnHeader = Instance.new("TextLabel")
+    AnnHeader.BackgroundTransparency = 1
+    AnnHeader.Position = UDim2.new(0, 16, 0, 14)
+    AnnHeader.Size = UDim2.new(1, -32, 0, 20)
+    AnnHeader.Font = Enum.Font.GothamBold
+    AnnHeader.TextSize = 13
+    AnnHeader.TextColor3 = Color3.fromRGB(255, 255, 255)
+    AnnHeader.TextXAlignment = Enum.TextXAlignment.Left
+    AnnHeader.Text = "📢  Sunucu Duyurusu (P2P Kanal 0x01)"
+    AnnHeader.ZIndex = 24
+    AnnHeader.Parent = AnnCard
+
+    local AnnInput = Instance.new("TextBox")
+    AnnInput.Position = UDim2.new(0, 16, 0, 42)
+    AnnInput.Size = UDim2.new(1, -32, 0, 68)
+    AnnInput.BackgroundColor3 = Color3.fromRGB(22, 26, 33)
+    AnnInput.BorderSizePixel = 0
+    AnnInput.Font = Enum.Font.Gotham
+    AnnInput.TextSize = 12
+    AnnInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    AnnInput.PlaceholderText = "Duyuru mesajınızı yazın..."
+    AnnInput.PlaceholderColor3 = Color3.fromRGB(115, 125, 140)
+    AnnInput.Text = ""
+    AnnInput.TextXAlignment = Enum.TextXAlignment.Left
+    AnnInput.TextYAlignment = Enum.TextYAlignment.Top
+    AnnInput.ClearTextOnFocus = false
+    AnnInput.ZIndex = 24
+    AnnInput.Parent = AnnCard
+    Instance.new("UICorner", AnnInput).CornerRadius = UDim.new(0, 10)
+
+    local AnnSendBtn = Instance.new("TextButton")
+    AnnSendBtn.Position = UDim2.new(0, 16, 1, -46)
+    AnnSendBtn.Size = UDim2.new(1, -32, 0, 34)
+    AnnSendBtn.BackgroundColor3 = Color3.fromRGB(43, 50, 63)
+    AnnSendBtn.BorderSizePixel = 0
+    AnnSendBtn.Font = Enum.Font.GothamBold
+    AnnSendBtn.TextSize = 12
+    AnnSendBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    AnnSendBtn.Text = "➤  Duyuru Yap"
+    AnnSendBtn.AutoButtonColor = false
+    AnnSendBtn.ZIndex = 24
+    AnnSendBtn.Parent = AnnCard
+    Instance.new("UICorner", AnnSendBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(AnnSendBtn, function()
+        local msg = AnnInput.Text
+        if msg == "" then
+            msg = "ORBIT P2P Sunucu Duyurusu!"
+        end
+        P2PEngine.Broadcast(1, nil, 80)
+        P2PEngine.ShowBanner(LocalPlayer.Name, msg)
+        AnnInput.Text = ""
+    end, "Broadcast")
+
+    -- Alt Sağ: Sunucu Bilgileri Kartı
+    local InfoCard = CreateSectionCard(page, UDim2.new(0.56, 14, 0, 284), UDim2.new(0.44, -36, 0, 168))
+
+    local InfoHeader = Instance.new("TextLabel")
+    InfoHeader.BackgroundTransparency = 1
+    InfoHeader.Position = UDim2.new(0, 16, 0, 14)
+    InfoHeader.Size = UDim2.new(1, -32, 0, 20)
+    InfoHeader.Font = Enum.Font.GothamBold
+    InfoHeader.TextSize = 13
+    InfoHeader.TextColor3 = Color3.fromRGB(255, 255, 255)
+    InfoHeader.TextXAlignment = Enum.TextXAlignment.Left
+    InfoHeader.Text = "📊  Sunucu Bilgileri"
+    InfoHeader.ZIndex = 24
+    InfoHeader.Parent = InfoCard
+
+    local function CreateInfoRow(yPos, labelText, initialValue, isGreen)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Position = UDim2.new(0, 16, 0, yPos)
+        l.Size = UDim2.new(0.55, 0, 0, 20)
+        l.Font = Enum.Font.Gotham
+        l.TextSize = 12
+        l.TextColor3 = Color3.fromRGB(155, 165, 180)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.Text = labelText
+        l.ZIndex = 24
+        l.Parent = InfoCard
+
+        local v = Instance.new("TextLabel")
+        v.BackgroundTransparency = 1
+        v.Position = UDim2.new(0.5, 0, 0, yPos)
+        v.Size = UDim2.new(0.5, -16, 0, 20)
+        v.Font = Enum.Font.GothamBold
+        v.TextSize = 12
+        v.TextColor3 = isGreen and Color3.fromRGB(52, 211, 153) or Color3.fromRGB(255, 255, 255)
+        v.TextXAlignment = Enum.TextXAlignment.Right
+        v.Text = initialValue
+        v.ZIndex = 24
+        v.Parent = InfoCard
+        return v
+    end
+
+    local PlayerCountVal = CreateInfoRow(46, "Oyuncu Sayısı", tostring(#Players:GetPlayers()) .. " / " .. tostring(Players.MaxPlayers), false)
+    local UptimeVal = CreateInfoRow(74, "Sunucu Süresi", "0h 1m", false)
+    CreateInfoRow(102, "Oyun", "Baseplate", false)
+    CreateInfoRow(130, "Sunucu Durumu", "● Aktif", true)
+
+    task.spawn(function()
+        local startTick = os.time()
+        while ScreenGui and ScreenGui.Parent do
+            local elapsed = os.time() - startTick
+            local mins = math.floor(elapsed / 60)
+            local hrs = math.floor(mins / 60)
+            PlayerCountVal.Text = tostring(#Players:GetPlayers()) .. " / " .. tostring(Players.MaxPlayers)
+            UptimeVal.Text = string.format("%dh %dm", hrs, mins % 60)
+            task.wait(5)
+        end
+    end)
+end
+
+-- // ==========================================================================
+-- // SEKME 2: OYUNCU YÖNETİMİ & P2P PEER LİSTESİ
+-- // ==========================================================================
+do
+    local page = TabPages["Oyuncu Yönetimi"]
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, 22, 0, 16)
+    title.Size = UDim2.new(1, -44, 0, 24)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 17
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "Oyuncu Yönetimi & P2P Peer Senkronizasyonu"
+    title.ZIndex = 23
+    title.Parent = page
+
+    local PeerListFrame = Instance.new("ScrollingFrame")
+    PeerListFrame.Position = UDim2.new(0, 22, 0, 50)
+    PeerListFrame.Size = UDim2.new(0.55, -16, 0, 380)
+    PeerListFrame.BackgroundColor3 = Color3.fromRGB(28, 33, 42)
+    PeerListFrame.BorderSizePixel = 0
+    PeerListFrame.ScrollBarThickness = 3
+    PeerListFrame.ZIndex = 23
+    PeerListFrame.Parent = page
+    Instance.new("UICorner", PeerListFrame).CornerRadius = UDim.new(0, 14)
+
+    local pLayout = Instance.new("UIListLayout")
+    pLayout.Padding = UDim.new(0, 6)
+    pLayout.Parent = PeerListFrame
+
+    local ActionCard = CreateSectionCard(page, UDim2.new(0.55, 16, 0, 50), UDim2.new(0.45, -38, 0, 380))
+    local SelectedLbl = Instance.new("TextLabel")
+    SelectedLbl.BackgroundTransparency = 1
+    SelectedLbl.Position = UDim2.new(0, 16, 0, 14)
+    SelectedLbl.Size = UDim2.new(1, -32, 0, 22)
+    SelectedLbl.Font = Enum.Font.GothamBold
+    SelectedLbl.TextSize = 14
+    SelectedLbl.TextColor3 = Color3.fromRGB(56, 189, 248)
+    SelectedLbl.TextXAlignment = Enum.TextXAlignment.Left
+    SelectedLbl.Text = "Seçili: " .. LocalPlayer.Name
+    SelectedLbl.ZIndex = 24
+    SelectedLbl.Parent = ActionCard
+
+    local actions = {
+        { Label = "Yanına Işınlan (Goto)", Func = function(p)
+            if p and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and LocalPlayer.Character then
+                LocalPlayer.Character:PivotTo(p.Character.HumanoidRootPart.CFrame * CFrame.new(0, 0, -4))
+                AddLog("GOTO", LocalPlayer.Name, p.Name .. " yanına ışınlanıldı.")
+            end
+        end },
+        { Label = "P2P Yanına Çek (Bring)", Func = function(p)
+            if p then
+                P2PEngine.Broadcast(2, p, 90)
+                if p.Character and p.Character:FindFirstChild("HumanoidRootPart") and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                    p.Character:PivotTo(LocalPlayer.Character.HumanoidRootPart.CFrame * CFrame.new(0, 0, -4))
+                end
+            end
+        end },
+        { Label = "P2P Dondur / Çöz (Freeze)", Func = function(p)
+            if p then
+                P2PEngine.Broadcast(3, p, 90)
+                if p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    p.Character.HumanoidRootPart.Anchored = not p.Character.HumanoidRootPart.Anchored
+                end
+            end
+        end },
+        { Label = "P2P Haritadan Fırlat (Fling)", Func = function(p)
+            if p then
+                P2PEngine.Broadcast(4, p, 99)
+            end
+        end },
+        { Label = "Etrafında Yörüngede Dön (Orbit)", Func = function(p)
+            if OrbitState.OrbitTarget == p then
+                OrbitState.OrbitTarget = nil
+                AddLog("ORBIT", LocalPlayer.Name, "Yörünge dönüşü durduruldu.")
+            else
+                OrbitState.OrbitTarget = p
+                P2PEngine.Broadcast(5, p, 75)
+                AddLog("ORBIT", LocalPlayer.Name, p.Name .. " etrafında yörünge başlatıldı.")
+            end
+        end },
+        { Label = "Kamerayla İzle (Spectate)", Func = function(p)
+            if p and p.Character and p.Character:FindFirstChildOfClass("Humanoid") then
+                Workspace.CurrentCamera.CameraSubject = p.Character:FindFirstChildOfClass("Humanoid")
+            end
+        end }
+    }
+
+    for i, act in ipairs(actions) do
+        local aBtn = Instance.new("TextButton")
+        aBtn.Position = UDim2.new(0, 16, 0, 48 + (i - 1) * 48)
+        aBtn.Size = UDim2.new(1, -32, 0, 40)
+        aBtn.BackgroundColor3 = Color3.fromRGB(42, 49, 62)
+        aBtn.BorderSizePixel = 0
+        aBtn.Font = Enum.Font.GothamSemibold
+        aBtn.TextSize = 12
+        aBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        aBtn.Text = act.Label
+        aBtn.AutoButtonColor = false
+        aBtn.ZIndex = 24
+        aBtn.Parent = ActionCard
+        Instance.new("UICorner", aBtn).CornerRadius = UDim.new(0, 10)
+        AttachSpringEffect(aBtn, function()
+            act.Func(OrbitState.SelectedPlayer)
+        end, "Click")
+    end
+
+    RefreshPeersUI = function()
+        for _, ch in ipairs(PeerListFrame:GetChildren()) do
+            if ch:IsA("TextButton") then ch:Destroy() end
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local row = Instance.new("TextButton")
+            row.Size = UDim2.new(1, -12, 0, 44)
+            row.BackgroundColor3 = (OrbitState.SelectedPlayer == plr) and Color3.fromRGB(45, 55, 72) or Color3.fromRGB(34, 40, 50)
+            row.BorderSizePixel = 0
+            row.AutoButtonColor = false
+            row.Text = ""
+            row.ZIndex = 24
+            row.Parent = PeerListFrame
+            Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+
+            local isPeer = OrbitState.VerifiedPeers[plr.UserId]
+            local nl = Instance.new("TextLabel")
+            nl.BackgroundTransparency = 1
+            nl.Position = UDim2.new(0, 12, 0, 6)
+            nl.Size = UDim2.new(1, -24, 0, 16)
+            nl.Font = Enum.Font.GothamBold
+            nl.TextSize = 12
+            nl.TextColor3 = Color3.fromRGB(255, 255, 255)
+            nl.TextXAlignment = Enum.TextXAlignment.Left
+            nl.Text = plr.DisplayName .. " (@" .. plr.Name .. ")"
+            nl.ZIndex = 25
+            nl.Parent = row
+
+            local sl = Instance.new("TextLabel")
+            sl.BackgroundTransparency = 1
+            sl.Position = UDim2.new(0, 12, 0, 23)
+            sl.Size = UDim2.new(1, -24, 0, 14)
+            sl.Font = Enum.Font.GothamMedium
+            sl.TextSize = 11
+            sl.TextColor3 = isPeer and Color3.fromRGB(56, 189, 248) or Color3.fromRGB(148, 163, 184)
+            sl.TextXAlignment = Enum.TextXAlignment.Left
+            sl.Text = isPeer and "● P2P ORBIT Peer Aktif" or "○ Standart Roblox İstemcisi"
+            sl.ZIndex = 25
+            sl.Parent = row
+
+            AttachSpringEffect(row, function()
+                OrbitState.SelectedPlayer = plr
+                SelectedLbl.Text = "Seçili: " .. plr.Name
+                RefreshPeersUI()
+            end, "Click")
+        end
+    end
+    RefreshPeersUI()
+end
+
+-- // ==========================================================================
+-- // SEKME 3: HAREKET KONTROLLERİ (DÜZGÜN FLY, NOCLIP, HIZ & ZIPLAMA)
+-- // ==========================================================================
+local FlightLV = nil
+local FlightAO = nil
+local FlightAtt = nil
+
+local function SetFlyEnabled(state)
+    OrbitState.Flying = state
+    local char = LocalPlayer.Character
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+
+    if not state then
+        if FlightLV then FlightLV:Destroy(); FlightLV = nil end
+        if FlightAO then FlightAO:Destroy(); FlightAO = nil end
+        if FlightAtt then FlightAtt:Destroy(); FlightAtt = nil end
+        hum.PlatformStand = false
+        AddLog("HAREKET", LocalPlayer.Name, "Fly (Uçuş) kapatıldı.")
+        return
+    end
+
+    hum.PlatformStand = true
+    FlightAtt = Instance.new("Attachment")
+    FlightAtt.Name = "OrbitFlyAtt"
+    FlightAtt.Parent = root
+
+    FlightLV = Instance.new("LinearVelocity")
+    FlightLV.Attachment0 = FlightAtt
+    FlightLV.MaxForce = math.huge
+    FlightLV.VectorVelocity = Vector3.zero
+    FlightLV.Parent = root
+
+    FlightAO = Instance.new("AlignOrientation")
+    FlightAO.Attachment0 = FlightAtt
+    FlightAO.Mode = Enum.OrientationAlignmentMode.OneAttachment
+    FlightAO.MaxTorque = math.huge
+    FlightAO.Responsiveness = 50
+    FlightAO.CFrame = Workspace.CurrentCamera.CFrame
+    FlightAO.Parent = root
+
+    P2PEngine.Broadcast(5, nil, 70)
+    AddLog("HAREKET", LocalPlayer.Name, "Fly (Uçuş) aktif edildi. Hız: " .. tostring(OrbitConfig.FlySpeed))
+end
+
+do
+    local page = TabPages["Hareket Kontrolleri"]
+
+    local function CreateToggleCard(xPos, yPos, titleText, descText, onToggle)
+        local btn = Instance.new("TextButton")
+        btn.Position = UDim2.new(xPos, 22, 0, yPos)
+        btn.Size = UDim2.new(0.46, -16, 0, 74)
+        btn.BackgroundColor3 = Color3.fromRGB(32, 37, 46)
+        btn.BorderSizePixel = 0
+        btn.AutoButtonColor = false
+        btn.Text = ""
+        btn.ZIndex = 23
+        btn.Parent = page
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 14)
+        local st = Instance.new("UIStroke", btn)
+        st.Color = Color3.fromRGB(255, 255, 255)
+        st.Transparency = 0.88
+
+        local tl = Instance.new("TextLabel")
+        tl.BackgroundTransparency = 1
+        tl.Position = UDim2.new(0, 16, 0, 14)
+        tl.Size = UDim2.new(1, -32, 0, 20)
+        tl.Font = Enum.Font.GothamBold
+        tl.TextSize = 13
+        tl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        tl.TextXAlignment = Enum.TextXAlignment.Left
+        tl.Text = titleText .. ": KAPALI"
+        tl.ZIndex = 24
+        tl.Parent = btn
+
+        local dl = Instance.new("TextLabel")
+        dl.BackgroundTransparency = 1
+        dl.Position = UDim2.new(0, 16, 0, 38)
+        dl.Size = UDim2.new(1, -32, 0, 18)
+        dl.Font = Enum.Font.Gotham
+        dl.TextSize = 11
+        dl.TextColor3 = Color3.fromRGB(148, 163, 184)
+        dl.TextXAlignment = Enum.TextXAlignment.Left
+        dl.Text = descText
+        dl.ZIndex = 24
+        dl.Parent = btn
+
+        local active = false
+        AttachSpringEffect(btn, function()
+            active = not active
+            tl.Text = titleText .. (active and ": AKTİF" or ": KAPALI")
+            btn.BackgroundColor3 = active and Color3.fromRGB(28, 52, 74) or Color3.fromRGB(32, 37, 46)
+            st.Color = active and Color3.fromRGB(56, 189, 248) or Color3.fromRGB(255, 255, 255)
+            st.Transparency = active and 0.35 or 0.88
+            onToggle(active)
+        end, "Click")
+    end
+
+    CreateToggleCard(0, 20, "CFrame & LinearVelocity Fly", "Kamera yönüne duyarlı sarsıntısız uçuş (PC & Mobil)", function(v)
+        SetFlyEnabled(v)
+    end)
+
+    CreateToggleCard(0.5, 20, "RunService.Stepped Noclip", "Duvarlardan ve tüm engellerden sorunsuz geçin", function(v)
+        OrbitState.Noclip = v
+        AddLog("HAREKET", LocalPlayer.Name, "Noclip: " .. tostring(v))
+    end)
+
+    CreateToggleCard(0, 108, "Sınırsız Zıplama (InfJump)", "Havada istediğiniz kadar zıplayın", function(v)
+        OrbitState.InfiniteJump = v
+    end)
+
+    CreateToggleCard(0.5, 108, "P2P Vektör Aura Halkası", "Diğer ORBIT oyuncularında görünen yörünge aurası", function(v)
+        ApplyPeerAura(LocalPlayer, v)
+        if v then P2PEngine.Broadcast(5, nil, 88) end
+    end)
+
+    -- Hız Ayar Butonları (WalkSpeed, FlySpeed, JumpPower)
+    local SpeedCard = CreateSectionCard(page, UDim2.new(0, 22, 0, 200), UDim2.new(1, -44, 0, 180))
+    local function CreateValueControl(yOff, labelTitle, defaultVal, step, onApply)
+        local val = defaultVal
+        local lbl = Instance.new("TextLabel")
+        lbl.BackgroundTransparency = 1
+        lbl.Position = UDim2.new(0, 16, 0, yOff)
+        lbl.Size = UDim2.new(0.5, 0, 0, 34)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 13
+        lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Text = labelTitle .. ": " .. tostring(val)
+        lbl.ZIndex = 24
+        lbl.Parent = SpeedCard
+
+        local minusBtn = Instance.new("TextButton")
+        minusBtn.Position = UDim2.new(1, -150, 0, yOff + 2)
+        minusBtn.Size = UDim2.new(0, 60, 0, 30)
+        minusBtn.BackgroundColor3 = Color3.fromRGB(45, 52, 65)
+        minusBtn.Font = Enum.Font.GothamBold
+        minusBtn.TextSize = 14
+        minusBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        minusBtn.Text = "-" .. tostring(step)
+        minusBtn.AutoButtonColor = false
+        minusBtn.ZIndex = 24
+        minusBtn.Parent = SpeedCard
+        Instance.new("UICorner", minusBtn).CornerRadius = UDim.new(0, 8)
+
+        local plusBtn = Instance.new("TextButton")
+        plusBtn.Position = UDim2.new(1, -80, 0, yOff + 2)
+        plusBtn.Size = UDim2.new(0, 64, 0, 30)
+        plusBtn.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+        plusBtn.Font = Enum.Font.GothamBold
+        plusBtn.TextSize = 14
+        plusBtn.TextColor3 = Color3.fromRGB(15, 23, 42)
+        plusBtn.Text = "+" .. tostring(step)
+        plusBtn.AutoButtonColor = false
+        plusBtn.ZIndex = 24
+        plusBtn.Parent = SpeedCard
+        Instance.new("UICorner", plusBtn).CornerRadius = UDim.new(0, 8)
+
+        AttachSpringEffect(minusBtn, function()
+            val = math.max(8, val - step)
+            lbl.Text = labelTitle .. ": " .. tostring(val)
+            onApply(val)
+        end, "Click")
+
+        AttachSpringEffect(plusBtn, function()
+            val = math.min(350, val + step)
+            lbl.Text = labelTitle .. ": " .. tostring(val)
+            onApply(val)
+        end, "Click")
+    end
+
+    CreateValueControl(18, "Fly (Uçuş) Hızı", OrbitConfig.FlySpeed, 15, function(v)
+        OrbitConfig.FlySpeed = v
+    end)
+    CreateValueControl(72, "Yürüme Hızı (WalkSpeed)", OrbitConfig.WalkSpeed, 8, function(v)
+        OrbitConfig.WalkSpeed = v
+        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+            LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = v
+        end
+    end)
+    CreateValueControl(126, "Zıplama Gücü (JumpPower)", OrbitConfig.JumpPower, 15, function(v)
+        OrbitConfig.JumpPower = v
+        if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+            local h = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            h.UseJumpPower = true
+            h.JumpPower = v
+        end
+    end)
+end
+
+-- // ==========================================================================
+-- // SEKME 4: TELEPORT
+-- // ==========================================================================
+do
+    local page = TabPages["Teleport"]
+    for idx, wp in ipairs(OrbitState.Waypoints) do
+        local card = CreateSectionCard(page, UDim2.new(0, 22, 0, 20 + (idx - 1) * 64), UDim2.new(1, -44, 0, 54))
+        local nl = Instance.new("TextLabel")
+        nl.BackgroundTransparency = 1
+        nl.Position = UDim2.new(0, 16, 0, 10)
+        nl.Size = UDim2.new(0.6, 0, 0, 18)
+        nl.Font = Enum.Font.GothamBold
+        nl.TextSize = 13
+        nl.TextColor3 = Color3.fromRGB(255, 255, 255)
+        nl.TextXAlignment = Enum.TextXAlignment.Left
+        nl.Text = wp.Name
+        nl.ZIndex = 24
+        nl.Parent = card
+
+        local cl = Instance.new("TextLabel")
+        cl.BackgroundTransparency = 1
+        cl.Position = UDim2.new(0, 16, 0, 28)
+        cl.Size = UDim2.new(0.6, 0, 0, 16)
+        cl.Font = Enum.Font.Code
+        cl.TextSize = 11
+        cl.TextColor3 = Color3.fromRGB(148, 163, 184)
+        cl.TextXAlignment = Enum.TextXAlignment.Left
+        cl.Text = string.format("X: %d, Y: %d, Z: %d", wp.Pos.X, wp.Pos.Y, wp.Pos.Z)
+        cl.ZIndex = 24
+        cl.Parent = card
+
+        local tpBtn = Instance.new("TextButton")
+        tpBtn.AnchorPoint = Vector2.new(1, 0.5)
+        tpBtn.Position = UDim2.new(1, -16, 0.5, 0)
+        tpBtn.Size = UDim2.new(0, 110, 0, 32)
+        tpBtn.BackgroundColor3 = Color3.fromRGB(45, 52, 65)
+        tpBtn.Font = Enum.Font.GothamBold
+        tpBtn.TextSize = 12
+        tpBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        tpBtn.Text = "Işınlan →"
+        tpBtn.AutoButtonColor = false
+        tpBtn.ZIndex = 24
+        tpBtn.Parent = card
+        Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 8)
+
+        AttachSpringEffect(tpBtn, function()
+            if LocalPlayer.Character then
+                LocalPlayer.Character:PivotTo(CFrame.new(wp.Pos))
+                AddLog("TELEPORT", LocalPlayer.Name, wp.Name .. " konumuna ışınlanıldı.")
+            end
+        end, "Click")
+    end
+end
+
+-- // ==========================================================================
+-- // SEKME 5: KICK / BAN & P2P İZOLASYON
+-- // ==========================================================================
+do
+    local page = TabPages["Kick / Ban"]
+    local info = CreateSectionCard(page, UDim2.new(0, 22, 0, 20), UDim2.new(1, -44, 0, 150))
+
+    local lbl = Instance.new("TextLabel")
+    lbl.BackgroundTransparency = 1
+    lbl.Position = UDim2.new(0, 16, 0, 16)
+    lbl.Size = UDim2.new(1, -32, 0, 44)
+    lbl.Font = Enum.Font.GothamSemibold
+    lbl.TextSize = 13
+    lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = "Oyuncu Yönetimi sekmesinden seçtiğiniz oyuncuya P2P 0x06 Kick sinyali gönderebilir veya karakterini yerel sahnenizden tamamen izole edebilirsiniz (Client-Side Ban)."
+    lbl.ZIndex = 24
+    lbl.Parent = info
+
+    local kickBtn = Instance.new("TextButton")
+    kickBtn.Position = UDim2.new(0, 16, 0, 82)
+    kickBtn.Size = UDim2.new(0.48, -16, 0, 42)
+    kickBtn.BackgroundColor3 = Color3.fromRGB(180, 83, 9)
+    kickBtn.Font = Enum.Font.GothamBold
+    kickBtn.TextSize = 12
+    kickBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    kickBtn.Text = "Seçili Oyuncuya P2P Kick Gönder"
+    kickBtn.AutoButtonColor = false
+    kickBtn.ZIndex = 24
+    kickBtn.Parent = info
+    Instance.new("UICorner", kickBtn).CornerRadius = UDim.new(0, 10)
+
+    local banBtn = Instance.new("TextButton")
+    banBtn.Position = UDim2.new(0.52, 0, 0, 82)
+    banBtn.Size = UDim2.new(0.48, -16, 0, 42)
+    banBtn.BackgroundColor3 = Color3.fromRGB(190, 18, 60)
+    banBtn.Font = Enum.Font.GothamBold
+    banBtn.TextSize = 12
+    banBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    banBtn.Text = "Seçili Oyuncuyu Sahneden Sil (Ban)"
+    banBtn.AutoButtonColor = false
+    banBtn.ZIndex = 24
+    banBtn.Parent = info
+    Instance.new("UICorner", banBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(kickBtn, function()
+        local p = OrbitState.SelectedPlayer
+        if p then
+            P2PEngine.Broadcast(6, p, 99)
+        end
+    end, "Alert")
+
+    AttachSpringEffect(banBtn, function()
+        local p = OrbitState.SelectedPlayer
+        if p and p ~= LocalPlayer then
+            OrbitState.BannedUserIds[p.UserId] = true
+            if p.Character then p.Character:Destroy() end
+            AddLog("MOD_BAN", LocalPlayer.Name, p.Name .. " yerel sahneden izole edildi.")
+        end
+    end, "Alert")
+end
+
+-- // ==========================================================================
+-- // SEKME 6: SUNUCU YÖNETİMİ
+-- // ==========================================================================
+do
+    local page = TabPages["Sunucu Yönetimi"]
+    local envCard = CreateSectionCard(page, UDim2.new(0, 22, 0, 20), UDim2.new(1, -44, 0, 190))
+
+    local presets = {
+        { Title = "Gündüz Modu (14:00) + P2P Senkron", Func = function()
+            Lighting.ClockTime = 14
+            P2PEngine.Broadcast(7, nil, 58)
+        end },
+        { Title = "Gece Modu (00:00) + P2P Senkron", Func = function()
+            Lighting.ClockTime = 0
+            P2PEngine.Broadcast(7, nil, 1)
+        end },
+        { Title = "Düşük Yerçekimi (Gravity = 55)", Func = function()
+            Workspace.Gravity = 55
+            AddLog("ORTAM", LocalPlayer.Name, "Workspace.Gravity = 55 olarak ayarlandı.")
+        end },
+        { Title = "Normal Yerçekimi (Gravity = 196.2)", Func = function()
+            Workspace.Gravity = 196.2
+            AddLog("ORTAM", LocalPlayer.Name, "Workspace.Gravity = 196.2 olarak sıfırlandı.")
+        end }
+    }
+
+    for i, pr in ipairs(presets) do
+        local col = (i - 1) % 2
+        local row = math.floor((i - 1) / 2)
+        local b = Instance.new("TextButton")
+        b.Position = UDim2.new(col * 0.5, 16, 0, 20 + row * 72)
+        b.Size = UDim2.new(0.5, -28, 0, 54)
+        b.BackgroundColor3 = Color3.fromRGB(42, 49, 62)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 12
+        b.TextColor3 = Color3.fromRGB(255, 255, 255)
+        b.Text = pr.Title
+        b.AutoButtonColor = false
+        b.ZIndex = 24
+        b.Parent = envCard
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 10)
+        AttachSpringEffect(b, pr.Func, "Click")
+    end
+end
+
+-- // ==========================================================================
+-- // SEKME 7: KOMUT SİSTEMİ (CANLI KOMUT BAR + KOMUT LİSTESİ)
+-- // ==========================================================================
+local ExecuteOrbitCommand = nil
+do
+    local page = TabPages["Komut Sistemi"]
+
+    local CmdBox = Instance.new("TextBox")
+    CmdBox.Position = UDim2.new(0, 22, 0, 18)
+    CmdBox.Size = UDim2.new(1, -168, 0, 40)
+    CmdBox.BackgroundColor3 = Color3.fromRGB(18, 22, 29)
+    CmdBox.BorderSizePixel = 0
+    CmdBox.Font = Enum.Font.Code
+    CmdBox.TextSize = 13
+    CmdBox.TextColor3 = Color3.fromRGB(56, 189, 248)
+    CmdBox.PlaceholderText = "Komut girin (:fly 100, :noclip, :esp, :announce Merhaba, :speed 60)..."
+    CmdBox.PlaceholderColor3 = Color3.fromRGB(110, 120, 138)
+    CmdBox.Text = ""
+    CmdBox.ClearTextOnFocus = false
+    CmdBox.ZIndex = 24
+    CmdBox.Parent = page
+    Instance.new("UICorner", CmdBox).CornerRadius = UDim.new(0, 10)
+
+    local RunCmdBtn = Instance.new("TextButton")
+    RunCmdBtn.Position = UDim2.new(1, -136, 0, 18)
+    RunCmdBtn.Size = UDim2.new(0, 114, 0, 40)
+    RunCmdBtn.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+    RunCmdBtn.Font = Enum.Font.GothamBold
+    RunCmdBtn.TextSize = 12
+    RunCmdBtn.TextColor3 = Color3.fromRGB(10, 15, 25)
+    RunCmdBtn.Text = "Çalıştır"
+    RunCmdBtn.AutoButtonColor = false
+    RunCmdBtn.ZIndex = 24
+    RunCmdBtn.Parent = page
+    Instance.new("UICorner", RunCmdBtn).CornerRadius = UDim.new(0, 10)
+
+    ExecuteOrbitCommand = function(rawText)
+        local clean = string.gsub(rawText or "", "^%s*(.-)%s*$", "%1")
+        if clean == "" then return end
+        if string.sub(clean, 1, 1) == OrbitConfig.Prefix or string.sub(clean, 1, 1) == ":" then
+            clean = string.sub(clean, 2)
+        end
+        local parts = string.split(clean, " ")
+        local cmd = string.lower(parts[1] or "")
+        local arg1 = parts[2]
+
+        if cmd == "fly" then
+            if tonumber(arg1) then OrbitConfig.FlySpeed = tonumber(arg1) end
+            SetFlyEnabled(true)
+        elseif cmd == "unfly" then
+            SetFlyEnabled(false)
+        elseif cmd == "noclip" or cmd == "nc" then
+            OrbitState.Noclip = not OrbitState.Noclip
+            AddLog("KOMUT", LocalPlayer.Name, "Noclip: " .. tostring(OrbitState.Noclip))
+        elseif cmd == "speed" or cmd == "ws" then
+            local s = tonumber(arg1) or 60
+            if LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+                LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = s
+            end
+            AddLog("KOMUT", LocalPlayer.Name, "WalkSpeed = " .. tostring(s))
+        elseif cmd == "esp" then
+            OrbitState.ESP = not OrbitState.ESP
+            AddLog("KOMUT", LocalPlayer.Name, "Vektörel 2D ESP = " .. tostring(OrbitState.ESP))
+        elseif cmd == "announce" or cmd == "duyuru" then
+            table.remove(parts, 1)
+            local msg = table.concat(parts, " ")
+            P2PEngine.Broadcast(1, nil, 90)
+            P2PEngine.ShowBanner(LocalPlayer.Name, msg ~= "" and msg or "ORBIT P2P Duyurusu!")
+        end
+    end
+
+    AttachSpringEffect(RunCmdBtn, function()
+        ExecuteOrbitCommand(CmdBox.Text)
+        CmdBox.Text = ""
+    end, "Click")
+
+    LocalPlayer.Chatted:Connect(function(msg)
+        if string.sub(msg, 1, 1) == OrbitConfig.Prefix then
+            ExecuteOrbitCommand(msg)
+        end
+    end)
+
+    local cmdHelp = {
+        ":fly [hız] — Pürüzsüz CFrame + LinearVelocity uçuşu başlatır",
+        ":unfly — Uçuş modunu kapatır",
+        ":noclip — Duvarlardan geçme modunu açar/kapatır",
+        ":speed <değer> — Karakter yürüme hızını değiştirir",
+        ":esp — 2D Vektörel Oyuncu Kutu & Mesafe ESP katmanını açar",
+        ":announce <mesaj> — P2P Animate kanalıyla tüm ORBIT kullanıcılarına duyuru geçer"
+    }
+
+    for i, hText in ipairs(cmdHelp) do
+        local row = CreateSectionCard(page, UDim2.new(0, 22, 0, 72 + (i - 1) * 48), UDim2.new(1, -44, 0, 40))
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Position = UDim2.new(0, 14, 0, 0)
+        l.Size = UDim2.new(1, -28, 1, 0)
+        l.Font = Enum.Font.Code
+        l.TextSize = 12
+        l.TextColor3 = Color3.fromRGB(226, 232, 240)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.Text = hText
+        l.ZIndex = 24
+        l.Parent = row
+    end
+end
+
+-- // ==========================================================================
+-- // SEKME 8: EKSTRA ARAÇLAR (VEKTÖREL 2D ESP + CANLI P2P PAKET LOGLARI)
+-- // ==========================================================================
+do
+    local page = TabPages["Ekstra Araçlar"]
+
+    local espBtn = Instance.new("TextButton")
+    espBtn.Position = UDim2.new(0, 22, 0, 18)
+    espBtn.Size = UDim2.new(0.48, -22, 0, 44)
+    espBtn.BackgroundColor3 = Color3.fromRGB(38, 45, 58)
+    espBtn.Font = Enum.Font.GothamBold
+    espBtn.TextSize = 12
+    espBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    espBtn.Text = "Vektörel 2D ESP Katmanı: KAPALI"
+    espBtn.AutoButtonColor = false
+    espBtn.ZIndex = 24
+    espBtn.Parent = page
+    Instance.new("UICorner", espBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(espBtn, function()
+        OrbitState.ESP = not OrbitState.ESP
+        espBtn.Text = "Vektörel 2D ESP Katmanı: " .. (OrbitState.ESP and "AÇIK" or "KAPALI")
+        espBtn.BackgroundColor3 = OrbitState.ESP and Color3.fromRGB(22, 101, 52) or Color3.fromRGB(38, 45, 58)
+    end, "Click")
+
+    local pingBtn = Instance.new("TextButton")
+    pingBtn.Position = UDim2.new(0.52, 0, 0, 18)
+    pingBtn.Size = UDim2.new(0.48, -22, 0, 44)
+    pingBtn.BackgroundColor3 = Color3.fromRGB(42, 52, 68)
+    pingBtn.Font = Enum.Font.GothamBold
+    pingBtn.TextSize = 12
+    pingBtn.TextColor3 = Color3.fromRGB(56, 189, 248)
+    pingBtn.Text = "P2P Peer Keşif Sinyali Gönder (0x08)"
+    pingBtn.AutoButtonColor = false
+    pingBtn.ZIndex = 24
+    pingBtn.Parent = page
+    Instance.new("UICorner", pingBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(pingBtn, function()
+        P2PEngine.Broadcast(8, nil, 95)
+    end, "Broadcast")
+
+    local LogScroll = Instance.new("ScrollingFrame")
+    LogScroll.Position = UDim2.new(0, 22, 0, 74)
+    LogScroll.Size = UDim2.new(1, -44, 0, 350)
+    LogScroll.BackgroundColor3 = Color3.fromRGB(16, 19, 25)
+    LogScroll.BorderSizePixel = 0
+    LogScroll.ScrollBarThickness = 3
+    LogScroll.ZIndex = 23
+    LogScroll.Parent = page
+    Instance.new("UICorner", LogScroll).CornerRadius = UDim.new(0, 12)
+
+    local logLayout = Instance.new("UIListLayout")
+    logLayout.Padding = UDim.new(0, 4)
+    logLayout.Parent = LogScroll
+
+    RefreshLogUI = function()
+        for _, ch in ipairs(LogScroll:GetChildren()) do
+            if ch:IsA("TextLabel") then ch:Destroy() end
+        end
+        for idx = 1, math.min(35, #OrbitState.Logs) do
+            local item = OrbitState.Logs[idx]
+            local l = Instance.new("TextLabel")
+            l.BackgroundTransparency = 1
+            l.Size = UDim2.new(1, -16, 0, 20)
+            l.Font = Enum.Font.Code
+            l.TextSize = 11
+            l.TextColor3 = Color3.fromRGB(186, 230, 253)
+            l.TextXAlignment = Enum.TextXAlignment.Left
+            l.Text = string.format(" [%s] [%s] %s -> %s", item.Time, item.Category, item.Sender, item.Message)
+            l.ZIndex = 24
+            l.Parent = LogScroll
+        end
+        LogScroll.CanvasSize = UDim2.new(0, 0, 0, math.min(35, #OrbitState.Logs) * 24)
+    end
+    RefreshLogUI()
+end
+
+-- // ==========================================================================
+-- // SEKME 9: AYARLAR
+-- // ==========================================================================
+do
+    local page = TabPages["Ayarlar"]
+    local sCard = CreateSectionCard(page, UDim2.new(0, 22, 0, 20), UDim2.new(1, -44, 0, 220))
+
+    local soundBtn = Instance.new("TextButton")
+    soundBtn.Position = UDim2.new(0, 16, 0, 20)
+    soundBtn.Size = UDim2.new(1, -32, 0, 42)
+    soundBtn.BackgroundColor3 = Color3.fromRGB(42, 49, 62)
+    soundBtn.Font = Enum.Font.GothamBold
+    soundBtn.TextSize = 12
+    soundBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    soundBtn.Text = "Tıklama & P2P Ses Efektleri: AÇIK"
+    soundBtn.AutoButtonColor = false
+    soundBtn.ZIndex = 24
+    soundBtn.Parent = sCard
+    Instance.new("UICorner", soundBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(soundBtn, function()
+        OrbitConfig.SoundEnabled = not OrbitConfig.SoundEnabled
+        soundBtn.Text = "Tıklama & P2P Ses Efektleri: " .. (OrbitConfig.SoundEnabled and "AÇIK" or "KAPALI")
+    end, "Click")
+
+    local rippleBtn = Instance.new("TextButton")
+    rippleBtn.Position = UDim2.new(0, 16, 0, 74)
+    rippleBtn.Size = UDim2.new(1, -32, 0, 42)
+    rippleBtn.BackgroundColor3 = Color3.fromRGB(42, 49, 62)
+    rippleBtn.Font = Enum.Font.GothamBold
+    rippleBtn.TextSize = 12
+    rippleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    rippleBtn.Text = "Dokunulan Yerde İz (Touch Ripple): AÇIK"
+    rippleBtn.AutoButtonColor = false
+    rippleBtn.ZIndex = 24
+    rippleBtn.Parent = sCard
+    Instance.new("UICorner", rippleBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(rippleBtn, function()
+        OrbitConfig.RippleEnabled = not OrbitConfig.RippleEnabled
+        rippleBtn.Text = "Dokunulan Yerde İz (Touch Ripple): " .. (OrbitConfig.RippleEnabled and "AÇIK" or "KAPALI")
+    end, "Click")
+
+    local guideBtn = Instance.new("TextButton")
+    guideBtn.Position = UDim2.new(0, 16, 0, 128)
+    guideBtn.Size = UDim2.new(1, -32, 0, 42)
+    guideBtn.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+    guideBtn.Font = Enum.Font.GothamBold
+    guideBtn.TextSize = 12
+    guideBtn.TextColor3 = Color3.fromRGB(10, 15, 25)
+    guideBtn.Text = "Kullanım Talimatları & Tanıtım Ekranını Tekrar Göster"
+    guideBtn.AutoButtonColor = false
+    guideBtn.ZIndex = 24
+    guideBtn.Parent = sCard
+    Instance.new("UICorner", guideBtn).CornerRadius = UDim.new(0, 10)
+
+    AttachSpringEffect(guideBtn, function()
+        DimOverlay.Visible = true
+        TweenService:Create(DimOverlay, TweenInfo.new(0.25), { BackgroundTransparency = 0.35 }):Play()
+    end, "Click")
+end
+
+-- // PENCERE VE ADMİN BUTONU ETKİLEŞİMLERİ
+local function ToggleMainGui(forceState)
+    if forceState ~= nil then
+        OrbitState.GuiVisible = forceState
+    else
+        OrbitState.GuiVisible = not OrbitState.GuiVisible
+    end
+
+    if OrbitState.GuiVisible then
+        MainWin.Visible = true
+        MainWin.Size = UDim2.new(0, OrbitConfig.WinWidth * 0.92, 0, OrbitConfig.WinHeight * 0.92)
+        TweenService:Create(MainWin, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, OrbitConfig.WinWidth, 0, OrbitConfig.WinHeight)
+        }):Play()
+    else
+        MainWin.Visible = false
+    end
+end
+
+AttachSpringEffect(AdminToggleBtn, function()
+    if DimOverlay.Visible then
+        DimOverlay.Visible = false
+    end
+    ToggleMainGui(nil)
+end, "Click")
+
+AttachSpringEffect(CloseBtn, function()
+    ToggleMainGui(false)
+end, "Click")
+
+AttachSpringEffect(CollapseBtn, function()
+    OrbitState.CompactSidebar = not OrbitState.CompactSidebar
+    local sw = OrbitState.CompactSidebar and 58 or 210
+    TweenService:Create(Sidebar, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, sw, 1, -42)
+    }):Play()
+    TweenService:Create(ContentArea, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Position = UDim2.new(0, sw, 0, 42),
+        Size = UDim2.new(1, -sw, 1, -42)
+    }):Play()
+    ProfileNameLbl.Visible = not OrbitState.CompactSidebar
+    ProfileHandleLbl.Visible = not OrbitState.CompactSidebar
+    for _, bData in pairs(TabButtons) do
+        bData.Label.Visible = not OrbitState.CompactSidebar
+    end
+end, "Click")
+
+AttachSpringEffect(MaxBtn, function()
+    OrbitState.Maximized = not OrbitState.Maximized
+    local vp = Workspace.CurrentCamera.ViewportSize
+    local tw = OrbitState.Maximized and math.min(1120, vp.X - 40) or 880
+    local th = OrbitState.Maximized and math.min(720, vp.Y - 60) or 540
+    OrbitConfig.WinWidth = tw
+    OrbitConfig.WinHeight = th
+    TweenService:Create(MainWin, TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, tw, 0, th)
+    }):Play()
+end, "Click")
+
+AttachSpringEffect(BellBtn, function()
+    SwitchToTab("Ekstra Araçlar")
+end, "Tab")
+
+AttachSpringEffect(IntroStartBtn, function()
+    TweenService:Create(DimOverlay, TweenInfo.new(0.25), { BackgroundTransparency = 1 }):Play()
+    if Lighting:FindFirstChild("OrbitIntroBlur") then
+        Lighting.OrbitIntroBlur:Destroy()
+    end
+    task.delay(0.25, function()
+        DimOverlay.Visible = false
+        ToggleMainGui(true)
+    end)
+end, "Intro")
+
+-- // FİZİK, FLY, NOCLIP, ORBIT & VEKTÖREL 2D ESP ANA DÖNGÜSÜ
+local EspBoxes = {}
+
+RunService.RenderStepped:Connect(function(dt)
+    local char = LocalPlayer.Character
+    local cam = Workspace.CurrentCamera
+    if char and cam then
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+
+        -- 1. FLY (Hem PC WASD hem Mobil Thumbstick MoveDirection ile %100 Uyumlu)
+        if OrbitState.Flying and root and hum and FlightLV and FlightAO then
+            local moveDir = hum.MoveDirection
+            local upDown = 0
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then upDown = upDown + 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+                upDown = upDown - 1
+            end
+
+            local camCF = cam.CFrame
+            local targetVel = (moveDir * OrbitConfig.FlySpeed) + Vector3.new(0, (camCF.LookVector.Y * moveDir.Magnitude * OrbitConfig.FlySpeed) + (upDown * OrbitConfig.FlySpeed), 0)
+            FlightLV.VectorVelocity = FlightLV.VectorVelocity:Lerp(targetVel, math.clamp(dt * 12, 0, 1))
+            FlightAO.CFrame = camCF
+        end
+
+        -- 2. ORBIT (Seçili Oyuncu Etrafında Dönüş)
+        if OrbitState.OrbitTarget and OrbitState.OrbitTarget.Character and root then
+            local tRoot = OrbitState.OrbitTarget.Character:FindFirstChild("HumanoidRootPart")
+            if tRoot then
+                OrbitState.OrbitAngle = OrbitState.OrbitAngle + dt * 3.8
+                local offset = Vector3.new(math.cos(OrbitState.OrbitAngle) * 8, 1.5, math.sin(OrbitState.OrbitAngle) * 8)
+                root.CFrame = CFrame.new(tRoot.Position + offset, tRoot.Position)
+            end
+        end
+    end
+
+    -- 3. VEKTÖREL 2D ESP KATMANI
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local box = EspBoxes[plr]
+            if OrbitState.ESP and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") and cam then
+                local r = plr.Character.HumanoidRootPart
+                local screenPos, onScreen = cam:WorldToViewportPoint(r.Position)
+                if onScreen then
+                    if not box then
+                        box = Instance.new("Frame")
+                        box.Name = "ESP_" .. plr.Name
+                        box.AnchorPoint = Vector2.new(0.5, 0.5)
+                        box.BackgroundTransparency = 1
+                        box.Size = UDim2.new(0, 54, 0, 74)
+                        box.ZIndex = 10
+                        local st = Instance.new("UIStroke", box)
+                        st.Color = OrbitState.VerifiedPeers[plr.UserId] and Color3.fromRGB(56, 189, 248) or Color3.fromRGB(34, 197, 94)
+                        st.Thickness = 1.6
+                        local nl = Instance.new("TextLabel", box)
+                        nl.Name = "Info"
+                        nl.BackgroundTransparency = 1
+                        nl.Position = UDim2.new(0.5, -80, 0, -18)
+                        nl.Size = UDim2.new(0, 160, 0, 16)
+                        nl.Font = Enum.Font.Code
+                        nl.TextSize = 11
+                        nl.TextColor3 = Color3.fromRGB(56, 189, 248)
+                        nl.Text = plr.Name
+                        box.Parent = ScreenGui
+                        EspBoxes[plr] = box
+                    end
+                    local dist = math.floor((cam.CFrame.Position - r.Position).Magnitude)
+                    local scale = math.clamp(1200 / math.max(dist, 10), 28, 120)
+                    box.Position = UDim2.new(0, screenPos.X, 0, screenPos.Y)
+                    box.Size = UDim2.new(0, scale * 0.75, 0, scale)
+                    box.Visible = true
+                    if box:FindFirstChild("Info") then
+                        box.Info.Text = string.format("%s [%dm]", plr.Name, dist)
+                    end
+                elseif box then
+                    box.Visible = false
+                end
+            elseif box then
+                box.Visible = false
+            end
+        end
+    end
+end)
+
+-- Noclip Döngüsü
+RunService.Stepped:Connect(function()
+    if OrbitState.Noclip and LocalPlayer.Character then
+        for _, part in ipairs(LocalPlayer.Character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+end)
+
+-- Sınırsız Zıplama
+UserInputService.JumpRequest:Connect(function()
+    if OrbitState.InfiniteJump and LocalPlayer.Character then
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end)
+
+-- // ==========================================================================
+-- // 3 SANİYE BEKLEME -> SAĞDAN KAYAN ADMİN BUTONU -> EKRAN KARARTMA & TANITIM
+-- // ==========================================================================
+task.delay(OrbitConfig.StartupDelay, function()
+    PlaySound("Intro", 1.0)
+    AddLog("READY", "ORBIT", "3 saniye doldu! Sağ Admin butonu kayarak ekrana geldi ve tanıtım açıldı.")
+
+    -- 1. Sağdaki Admin butonunu smooth şekilde ekrana kaydır
+    TweenService:Create(AdminToggleBtn, TweenInfo.new(0.65, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+        Position = UDim2.new(1, -18, 0, 56)
+    }):Play()
+
+    -- 2. Ekranı hafifçe karart + Blur ekle ve Kullanım Talimatları penceresini göster
+    local blur = Instance.new("BlurEffect")
+    blur.Name = "OrbitIntroBlur"
+    blur.Size = 0
+    blur.Parent = Lighting
+    TweenService:Create(blur, TweenInfo.new(0.45), { Size = 10 }):Play()
+
+    DimOverlay.Visible = true
+    TweenService:Create(DimOverlay, TweenInfo.new(0.45), { BackgroundTransparency = 0.35 }):Play()
+
+    -- 3. P2P Handshake Sinyali Gönder (Diğer ORBIT kullanıcıları bizi otomatik algılasın)
+    P2PEngine.Broadcast(8, nil, 95)
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "ORBIT P2P Admin Hazır",
+            Text = "Sağ üstteki Admin butonu aktif! P2P Animate kanalı bağlandı.",
+            Duration = 5
+        })
+    end)
+end)
